@@ -115,7 +115,24 @@ async function fetchWithAuth(url, options = {}) {
         headers['Content-Type'] = 'application/json';
     }
     options.headers = headers;
-    const res = await fetch(url, options);
+
+    // Hard timeout so a stalled connection (TCP opens but the server / proxy /
+    // VPN never sends a response) can never hang the caller forever. Without this
+    // a single pending request leaves the UI frozen with no error — e.g. pressing
+    // Start would do nothing at all because startTracking() awaits this call before
+    // it shows any feedback or starts the timer. On timeout we abort, which rejects
+    // the fetch and lets callers fall into their offline path.
+    const { timeoutMs = 15000, ...fetchOptions } = options;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    if (!fetchOptions.signal) fetchOptions.signal = controller.signal;
+
+    let res;
+    try {
+        res = await fetch(url, fetchOptions);
+    } finally {
+        clearTimeout(timeoutId);
+    }
     if (res.status === 401) {
         console.warn('Session expired or unauthorized. Redirecting to login...');
         if (isTracking) {
@@ -263,7 +280,6 @@ async function startTracking() {
     // Clear any existing leftover intervals to avoid duplicates
     if (uiInterval) clearInterval(uiInterval);
     if (trackingInterval) clearInterval(trackingInterval);
-    if (rulesRefreshInterval) clearInterval(rulesRefreshInterval);
     if (shouldStreamCheckInterval) clearInterval(shouldStreamCheckInterval);
     if (streamInterval) clearInterval(streamInterval);
     if (antiCheatInterval) clearTimeout(antiCheatInterval);
@@ -274,27 +290,46 @@ async function startTracking() {
         const taskId = taskSelect && taskSelect.value !== 'general_work' && taskSelect.value !== '' ? parseInt(taskSelect.value) : null;
         const taskTitle = document.getElementById('taskTitle').value || __('general_task');
         currentSessionSeconds = 0; // Reset session time
-        
-        // Optimistic Network Fetch
+
+        // Optimistic UI + timer: flip the controls and START COUNTING immediately,
+        // BEFORE the network round-trip. The session-start request below is
+        // best-effort — it can be slow, time out, or fail while offline — and none
+        // of that must delay the visible feedback. Previously every UI change and
+        // the timer ran only AFTER awaiting the server, so a stalled request made
+        // pressing Start look completely dead. timeLogId / seconds are reconciled
+        // once the server (or the offline fallback) responds.
+        if (taskSelect) taskSelect.disabled = true;
+        document.getElementById('taskTitle').disabled = true;
+        if (trackBtn) {
+            trackBtn.classList.add('active');
+            document.getElementById('btnIcon').innerText = '⏸';
+            document.getElementById('btnText').innerText = __('btn_stop');
+            trackBtn.disabled = false;
+        }
+        document.getElementById('statusText').innerText = __('tracking_active');
+        if (uiInterval) clearInterval(uiInterval);
+        uiInterval = setInterval(incrementAndDisplay, 1000);
+
+        // Network session start (best-effort; reconciles state when it returns).
         try {
             const response = await fetchWithAuth(`${API_BASE}/tracking/session/start`, {
                 method: 'POST',
-                body: JSON.stringify({ project_id: null, task_id: taskId, task_title: taskTitle }) 
+                body: JSON.stringify({ project_id: null, task_id: taskId, task_title: taskTitle })
             });
             const data = await response.json();
             if(!response.ok) throw new Error(data.message || 'Failed to start session');
-            
+
             timeLogId = data.time_log_id;
-            seconds = data.today_total_seconds || seconds; 
+            seconds = data.today_total_seconds || seconds;
             document.getElementById('statusText').innerText = __('tracking_active');
-            
+
         } catch(netErr) {
             console.warn("Offline! creating shadow local session", netErr);
             // Secure client UUID bound to precise timestamp and random noise
             timeLogId = 'local_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
             offlineSessionStartTime = new Date().toISOString();
             document.getElementById('statusText').innerText = __('offline_tracking_active');
-            
+
             // Insert unclosed session record locally
             if(offlineDb) {
                 const tx = offlineDb.transaction('offline_sessions', 'readwrite');
@@ -308,20 +343,7 @@ async function startTracking() {
                 });
             }
         }
-        
-        if(taskSelect) taskSelect.disabled = true;
-        document.getElementById('taskTitle').disabled = true;
-        
-        // Update UI
-        if (trackBtn) {
-            trackBtn.classList.add('active');
-            document.getElementById('btnIcon').innerText = '⏸';
-            document.getElementById('btnText').innerText = __('btn_stop');
-            trackBtn.disabled = false;
-        }
 
-        // Start timers
-        uiInterval = setInterval(incrementAndDisplay, 1000);
         
         // Background interval (Runs every 1 minute)
         trackingInterval = setInterval(async () => {
@@ -346,13 +368,6 @@ async function startTracking() {
                 progress.style.width = Math.floor(Math.random() * 30 + 70) + '%';
             }
         }, 60000);
-
-        // Re-fetch the employee's Productivity Rules every 30s so admin changes
-        // (e.g. flipping WhatsApp from Neutral to Distracting) take effect within
-        // seconds instead of only on app restart. Keeps blockList fresh so the
-        // active blocker can close the window and stop the timer right away.
-        if (rulesRefreshInterval) clearInterval(rulesRefreshInterval);
-        rulesRefreshInterval = setInterval(loadDistractingApps, 30000);
            // -------------------------
         // LIVE VIDEO STREAMING ENGINE (WebRTC & Command Listener)
         // -------------------------
@@ -440,8 +455,27 @@ async function startTracking() {
             }
         }, 30000);
     } catch (error) {
+        // The timer/UI are now started optimistically above, so on a late failure
+        // tear them back down instead of leaving a zombie (timer ticking while
+        // isTracking is false). Reset fully to the idle state before alerting.
         isTracking = false;
-        if (trackBtn) trackBtn.disabled = false;
+        if (uiInterval) { clearInterval(uiInterval); uiInterval = null; }
+        if (trackBtn) {
+            trackBtn.classList.remove('active');
+            const btnIcon = document.getElementById('btnIcon');
+            if (btnIcon) btnIcon.innerText = '▶';
+            const btnText = document.getElementById('btnText');
+            if (btnText) btnText.innerText = __('btn_start');
+            trackBtn.disabled = false;
+        }
+        const statusText = document.getElementById('statusText');
+        if (statusText) statusText.innerText = __('status_paused');
+        const taskSelect = document.getElementById('taskSelect');
+        if (taskSelect) taskSelect.disabled = false;
+        const taskTitle = document.getElementById('taskTitle');
+        if (taskTitle && (!taskSelect || taskSelect.value === 'general_work' || taskSelect.value === '')) {
+            taskTitle.disabled = false;
+        }
         alert(__('error_starting') + error.message);
     }
 }
@@ -466,17 +500,10 @@ async function stopTracking() {
 
     if (uiInterval) clearInterval(uiInterval);
     if (trackingInterval) clearInterval(trackingInterval);
-<<<<<<< HEAD
     // NOTE: rulesRefreshInterval and distractionGuardInterval are intentionally
     // NOT cleared here. The guard interval keeps ticking, but enforceDistractionBlock()
     // now returns early while isTracking === false, so after a stop/pause it stays
     // silent and lets the user open any app until tracking resumes.
-=======
-    if (rulesRefreshInterval) {
-        clearInterval(rulesRefreshInterval);
-        rulesRefreshInterval = null;
-    }
->>>>>>> 48a7bba (Enforce distracting-app rules with dynamic refresh)
     if (shouldStreamCheckInterval) clearInterval(shouldStreamCheckInterval);
     if (streamInterval) {
         clearInterval(streamInterval);
@@ -659,9 +686,10 @@ async function uploadScreenshot(base64Image, screenIndex = 0) {
     try {
         const res = await fetchWithAuth(`${API_BASE}/tracking/screenshot`, {
             method: 'POST',
-            body: formData
+            body: formData,
+            timeoutMs: 60000 // image upload — allow longer than the default
         });
-        
+
         if(!res.ok) throw new Error('HTTP Status ' + res.status);
     } catch(err) {
         console.warn("Offline! Encrypting and buffering to IndexedDB:", err.message);
@@ -771,7 +799,8 @@ async function flushOfflineQueue() {
                     
                     const response = await fetchWithAuth(`${API_BASE}/tracking/screenshot`, {
                         method: 'POST',
-                        body: formData
+                        body: formData,
+                        timeoutMs: 60000 // image upload — allow longer than the default
                     });
                     
                     if (response.ok) {
@@ -1003,7 +1032,6 @@ async function uploadActivity() {
     if (document.getElementById('meetingModeToggle') && document.getElementById('meetingModeToggle').checked) {
         activeWindowTitle = __('in_meeting_tag') + activeWindowTitle;
     }
-<<<<<<< HEAD
 
     // `blockList` is populated by loadDistractingApps() from GET /tracking/rules,
     // which returns this employee's RESOLVED distracting apps. The persistent
@@ -1012,31 +1040,6 @@ async function uploadActivity() {
     // the same shared enforcement so behavior is identical.
     if (isWindowProhibited(activeWindowTitle)) {
         await triggerDistractionResponse(activeWindowTitle);
-=======
-    
-    // `blockList` is populated by loadDistractingApps() from GET /tracking/rules,
-    // which returns this employee's RESOLVED distracting apps (their individual
-    // Productivity Rules from employees/{id}/edit overlaid on the global rules).
-    const isProhibited = blockList.some(kw => activeWindowTitle.toLowerCase().includes(kw.toLowerCase()));
-
-    if (isProhibited) {
-        // Report violation to server
-        fetchWithAuth(API_BASE + '/tracking/violation', {
-            method: 'POST',
-            body: JSON.stringify({
-                type: 'prohibited_app_opened',
-                details: activeWindowTitle
-            })
-        }).catch(e => console.warn('Failed to send prohibited app violation:', e));
-
-        alert(__('proactive_warning', activeWindowTitle));
-        // Enforce the employee-specific 'distracting' rule: force-close the
-        // offending application window, then completely stop the tracking timer.
-        if (window.electronAPI && window.electronAPI.closeActiveWindow) {
-            await window.electronAPI.closeActiveWindow();
-        }
-        stopTracking();
->>>>>>> 48a7bba (Enforce distracting-app rules with dynamic refresh)
         return;
     }
 
@@ -1088,24 +1091,7 @@ async function uploadActivity() {
         // returns distracting_app_detected. When flagged, force-close the window
         // and completely stop the tracking timer.
         if (data && data.distracting_app_detected) {
-<<<<<<< HEAD
             await triggerDistractionResponse(data.distracting_app || activeWindowTitle);
-=======
-            const offending = data.distracting_app || activeWindowTitle;
-            fetchWithAuth(API_BASE + '/tracking/violation', {
-                method: 'POST',
-                body: JSON.stringify({
-                    type: 'prohibited_app_opened',
-                    details: offending
-                })
-            }).catch(e => console.warn('Failed to send prohibited app violation:', e));
-
-            alert(__('proactive_warning', offending));
-            if (window.electronAPI && window.electronAPI.closeActiveWindow) {
-                await window.electronAPI.closeActiveWindow();
-            }
-            stopTracking();
->>>>>>> 48a7bba (Enforce distracting-app rules with dynamic refresh)
             return;
         }
 
