@@ -39,3 +39,5 @@ This will compile the Windows Node bundles and drop `Omega Tracker Setup 1.0.0.e
 
 ### Auto-Updater Configuration
 If you desire Over-The-Air auto-updates running silently on your employee machines, adjust the `"publish"` block inside `package.json` to point to the remote domain hosting your artifacts before executing the build sequence.
+
+
