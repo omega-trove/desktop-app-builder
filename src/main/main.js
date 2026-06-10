@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, powerMonitor, desktopCapturer, Tray, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, powerMonitor, desktopCapturer, Tray, Menu, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { exec: _rawExec } = require('child_process');
@@ -136,11 +136,49 @@ function createWindow() {
         console.error('AutoUpdater Error:', err);
     });
 
-    // Close (X) button or any close action → terminate the app immediately.
-    // No prompt, no background/tray behavior: full exit every time.
-    mainWindow.on('close', () => {
-        isQuitting = true;
-        app.exit(0);
+    // Close (X) button or close actions:
+    // 1. If tracking is active: hide the window and continue in background.
+    // 2. If tracking is stopped: prompt the user to exit or keep running in background.
+    mainWindow.on('close', (e) => {
+        if (isQuitting) return; // Exit from system tray / Cmd+Q -> allow close
+        e.preventDefault();
+
+        if (distractionLockActive) {
+            return;
+        }
+
+        if (isTracking) {
+            mainWindow.hide(); // Tracking is active -> hide in background
+            return;
+        }
+
+        // Tracking is stopped -> prompt options
+        const isAr = appLocale === 'ar';
+        const title = isAr ? 'خروج من التطبيق' : 'Quit Application';
+        const message = isAr 
+            ? 'مؤقت تتبع الوقت متوقف حالياً. هل ترغب في إغلاق التطبيق تماماً أم إبقائه يعمل في الخلفية؟' 
+            : 'Time tracking is currently stopped. Do you want to exit the application completely or keep it running in the background?';
+        const buttons = isAr 
+            ? ['إغلاق تماماً', 'الاستمرار في الخلفية'] 
+            : ['Exit Completely', 'Keep Running in Background'];
+
+        dialog.showMessageBox(mainWindow, {
+            type: 'question',
+            buttons: buttons,
+            defaultId: 1,
+            title: title,
+            message: message,
+            cancelId: 1
+        }).then(({ response }) => {
+            if (response === 0) {
+                gracefulQuit();
+            } else {
+                mainWindow.hide();
+            }
+        }).catch(err => {
+            console.error('Error showing exit dialog:', err);
+            mainWindow.hide();
+        });
     });
 }
 
