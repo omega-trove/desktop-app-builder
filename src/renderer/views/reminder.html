@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            font-family: 'Poppins', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: transparent;
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 5px;
+            -webkit-user-select: none;
+            user-select: none;
+        }
+        .reminder-card {
+            display: flex;
+            width: 100%;
+            height: 100%;
+            background: #0b0f19;
+            background-image: 
+                radial-gradient(at 0% 0%, rgba(70, 69, 228, 0.15) 0px, transparent 70%),
+                radial-gradient(at 100% 100%, rgba(70, 69, 228, 0.08) 0px, transparent 70%);
+            border: 1px solid rgba(70, 69, 228, 0.3);
+            border-radius: 6px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.6);
+            align-items: center;
+            overflow: hidden;
+        }
+        /* Left: Clock Icon */
+        .icon-container {
+            width: 65px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            flex-shrink: 0;
+        }
+        .clock-icon {
+            width: 42px;
+            height: 42px;
+            border-radius: 50%;
+            border: 2px solid #4645E4;
+            position: relative;
+            background: #111827;
+            box-shadow: 0 0 10px rgba(70, 69, 228, 0.3);
+            flex-shrink: 0;
+        }
+        .clock-face-ticks-v {
+            position: absolute;
+            width: 2px;
+            height: 100%;
+            left: 50%;
+            top: 0;
+            transform: translateX(-50%);
+            background: linear-gradient(to bottom, #4645E4 3px, transparent 3px, transparent calc(100% - 3px), #4645E4 calc(100% - 3px));
+        }
+        .clock-face-ticks-h {
+            position: absolute;
+            width: 100%;
+            height: 2px;
+            top: 50%;
+            left: 0;
+            transform: translateY(-50%);
+            background: linear-gradient(to right, #4645E4 3px, transparent 3px, transparent calc(100% - 3px), #4645E4 calc(100% - 3px));
+        }
+        .clock-center {
+            width: 4px;
+            height: 4px;
+            border-radius: 50%;
+            background: #ffffff;
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 10;
+        }
+        .clock-hour {
+            position: absolute;
+            width: 2px;
+            height: 10px;
+            background: #ffffff;
+            left: 50%;
+            bottom: 50%;
+            transform-origin: bottom center;
+            transform: translateX(-50%) rotate(-60deg);
+            z-index: 4;
+        }
+        .clock-minute {
+            position: absolute;
+            width: 1.5px;
+            height: 14px;
+            background: #ffffff;
+            left: 50%;
+            bottom: 50%;
+            transform-origin: bottom center;
+            transform: translateX(-50%) rotate(90deg);
+            z-index: 3;
+        }
+        .clock-second {
+            position: absolute;
+            width: 1px;
+            height: 15px;
+            background: #ff0000;
+            left: 50%;
+            bottom: 50%;
+            transform-origin: bottom center;
+            transform: translateX(-50%) rotate(95deg);
+            z-index: 5;
+        }
+        .cross-badge {
+            position: absolute;
+            width: 18px;
+            height: 18px;
+            background: #ff0000;
+            border-radius: 50%;
+            bottom: -3px;
+            right: -3px;
+            border: 2px solid #ffffff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #ffffff;
+            font-size: 10px;
+            font-weight: bold;
+            font-family: Arial, sans-serif;
+            z-index: 12;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+            line-height: 1;
+        }
+        /* Center: Text */
+        .content-container {
+            flex: 1;
+            padding: 0 10px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        .title {
+            font-size: 16px;
+            font-weight: 700;
+            color: #fff;
+            margin-bottom: 2px;
+        }
+        .subtitle {
+            font-size: 11px;
+            font-weight: 400;
+            color: #9ca3af;
+        }
+        /* Right: Button */
+        .action-button {
+            width: 110px;
+            height: 100%;
+            border: none;
+            background: transparent;
+            border-left: 1.5px solid rgba(70, 69, 228, 0.25);
+            color: #ffffff;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding: 8px;
+        }
+        .action-button:hover {
+            background: rgba(70, 69, 228, 0.12);
+        }
+        .action-button:active {
+            background: rgba(70, 69, 228, 0.25);
+        }
+        
+        /* RTL layout adjustments */
+        body[dir="rtl"] .action-button {
+            border-left: none;
+            border-right: 1.5px solid rgba(70, 69, 228, 0.25);
+        }
+    </style>
+</head>
+<body>
+    <div class="reminder-card">
+        <div class="icon-container">
+            <div class="clock-icon">
+                <div class="clock-face-ticks-v"></div>
+                <div class="clock-face-ticks-h"></div>
+                <div class="clock-center"></div>
+                <div class="clock-hour"></div>
+                <div class="clock-minute"></div>
+                <div class="clock-second"></div>
+                <div class="cross-badge">✕</div>
+            </div>
+        </div>
+        <div class="content-container">
+            <div class="title" id="reminderTitle">On a break</div>
+            <div class="subtitle" id="reminderSubtitle">Please start the timer</div>
+        </div>
+        <button class="action-button" id="stopBtn">Stop Reminding</button>
+    </div>
+
+    <script>
+        const locale = localStorage.getItem('tracker_locale') || 'ar';
+        if (locale === 'ar') {
+            document.body.dir = 'rtl';
+            document.getElementById('reminderTitle').innerText = 'أنت في استراحة';
+            document.getElementById('reminderSubtitle').innerText = 'يرجى تفعيل مؤقت العمل';
+            document.getElementById('stopBtn').innerText = 'إيقاف التذكير';
+        } else {
+            document.body.dir = 'ltr';
+            document.getElementById('reminderTitle').innerText = 'On a break';
+            document.getElementById('reminderSubtitle').innerText = 'Please start the timer';
+            document.getElementById('stopBtn').innerText = 'Stop Reminding';
+        }
+
+        document.getElementById('stopBtn').addEventListener('click', () => {
+            if (window.electronAPI && window.electronAPI.stopRemindingClicked) {
+                window.electronAPI.stopRemindingClicked();
+            }
+        });
+    </script>
+</body>
+</html>

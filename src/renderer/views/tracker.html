@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Omega Track - Tracker</title>
+    
+    <!-- Premium Cross-Platform Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            --primary: #4645E4;
+            --primary-light: #4645E4;
+            --primary-glow: rgba(70, 69, 228, 0.25);
+            --bg-body: #0b0f19;
+            --card-bg: rgba(17, 24, 39, 0.85);
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+            --text-light: #6b7280;
+            --border-color: rgba(255, 255, 255, 0.08);
+            --radius-lg: 16px;
+            --radius-md: 10px;
+        }
+
+        body {
+            font-family: 'Poppins', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: var(--bg-body);
+            background-image: 
+                radial-gradient(at 0% 0%, rgba(70, 69, 228, 0.1) 0px, transparent 40%),
+                radial-gradient(at 100% 100%, rgba(70, 69, 228, 0.05) 0px, transparent 40%);
+            margin: 0;
+            color: var(--text-main);
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+            -webkit-user-select: none;
+            user-select: none;
+        }
+
+        /* Glassmorphic Dark Header */
+        .header {
+            background: rgba(17, 24, 39, 0.7);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            padding: 18px 24px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            z-index: 10;
+        }
+
+        .user-info {
+            font-family: 'Poppins', sans-serif;
+            font-weight: 700;
+            font-size: 15px;
+            color: #fff;
+            letter-spacing: -0.2px;
+        }
+
+        .logout-btn {
+            background: transparent;
+            border: none;
+            color: #ef4444;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 700;
+            transition: all 0.2s ease;
+            padding: 4px 8px;
+            border-radius: 6px;
+        }
+
+        .logout-btn:hover {
+            color: #f87171;
+            background: rgba(239, 68, 68, 0.08);
+        }
+
+        .main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            position: relative;
+        }
+
+        /* High-Impact Tech Timer */
+        .timer {
+            font-family: 'Share Tech Mono', 'Courier New', monospace;
+            font-size: 58px;
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+            margin-bottom: 24px;
+            color: #fff;
+            text-shadow: 0 0 20px rgba(70, 69, 228, 0.5);
+            letter-spacing: 2px;
+        }
+
+        /* 3D Dynamic Glowing Tracking Orb */
+        .track-btn {
+            width: 140px;
+            height: 140px;
+            border-radius: 50%;
+            border: none;
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-light) 100%);
+            color: white;
+            font-size: 18px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: 0 10px 25px -3px rgba(70, 69, 228, 0.4), inset 0 2px 4px rgba(255,255,255,0.2);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+            position: relative;
+            outline: none;
+        }
+
+        .track-btn:hover {
+            transform: scale(1.04);
+            box-shadow: 0 14px 30px -3px rgba(255, 132, 48, 0.55), inset 0 2px 4px rgba(255,255,255,0.25);
+        }
+
+        .track-btn:active {
+            transform: scale(0.98);
+        }
+
+        .track-btn.active {
+            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+            box-shadow: 0 10px 25px -3px rgba(239, 68, 68, 0.4), inset 0 2px 4px rgba(255,255,255,0.2);
+            animation: track-pulse 2s infinite;
+        }
+
+        .track-btn.active:hover {
+            box-shadow: 0 14px 30px -3px rgba(239, 68, 68, 0.6), inset 0 2px 4px rgba(255,255,255,0.25);
+        }
+
+        @keyframes track-pulse {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5), 0 10px 25px -3px rgba(239, 68, 68, 0.4); }
+            70% { box-shadow: 0 0 0 18px rgba(239, 68, 68, 0), 0 10px 25px -3px rgba(239, 68, 68, 0.4); }
+            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0), 0 10px 25px -3px rgba(239, 68, 68, 0.4); }
+        }
+
+        .status-text {
+            margin-top: 20px;
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--text-muted);
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }
+
+        /* Pill status chip indicators */
+        .sync-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--border-color);
+            padding: 4px 10px;
+            border-radius: 20px;
+        }
+
+        .sync-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+            transition: all 0.3s ease;
+        }
+        
+        .sync-dot.online {
+            background-color: #10b981;
+            box-shadow: 0 0 8px #10b981;
+        }
+        
+        .sync-dot.syncing {
+            background-color: #3b82f6;
+            animation: sync-pulse 1.2s infinite;
+        }
+        
+        .sync-dot.offline {
+            background-color: #FF8430;
+            box-shadow: 0 0 8px #FF8430;
+        }
+        
+        @keyframes sync-pulse {
+            0% { transform: scale(0.8); opacity: 0.5; box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.7); }
+            50% { transform: scale(1.2); opacity: 1; box-shadow: 0 0 0 4px rgba(59, 130, 246, 0); }
+            100% { transform: scale(0.8); opacity: 0.5; box-shadow: 0 0 0 0 rgba(59, 130, 246, 0); }
+        }
+
+        /* Sleek Task Input */
+        input[type="text"] {
+            width: 260px;
+            padding: 12px;
+            border-radius: var(--radius-md);
+            border: 1.5px solid var(--border-color);
+            margin-bottom: 20px;
+            text-align: center;
+            font-size: 13px;
+            background: rgba(17, 24, 39, 0.5);
+            color: #fff;
+            font-family: inherit;
+            outline: none;
+            transition: all 0.2s ease;
+        }
+
+        input[type="text"]:focus {
+            border-color: #FF8430;
+            background: rgba(17, 24, 39, 0.8);
+            box-shadow: 0 0 0 4px rgba(255, 132, 48, 0.18);
+        }
+
+        /* Custom Modern Select Dropdown */
+        select {
+            padding: 6px 12px;
+            border-radius: var(--radius-md);
+            border: 1px solid var(--border-color);
+            font-size: 12px;
+            cursor: pointer;
+            background: rgba(17, 24, 39, 0.6);
+            color: var(--text-main);
+            font-family: inherit;
+            outline: none;
+            transition: all 0.2s ease;
+        }
+
+        select:hover {
+            border-color: #FF8430;
+            background: rgba(17, 24, 39, 0.9);
+        }
+
+        select option {
+            background: #111827;
+            color: #fff;
+        }
+
+        /* Customized Slider Progress Bar */
+        .progress-bar-bg {
+            width: 260px;
+            background: rgba(255,255,255,0.06);
+            border-radius: 20px;
+            height: 6px;
+            margin-bottom: 8px;
+            overflow: hidden;
+            border: 1px solid rgba(255,255,255,0.02);
+        }
+
+        /* Toggle switches */
+        .meeting-checkbox {
+            appearance: none;
+            -webkit-appearance: none;
+            width: 18px;
+            height: 18px;
+            border: 1.5px solid var(--border-color);
+            border-radius: 4px;
+            background: rgba(17, 24, 39, 0.6);
+            cursor: pointer;
+            margin-right: 8px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            outline: none;
+            transition: all 0.2s;
+        }
+
+        .meeting-checkbox:checked {
+            background: #ef4444;
+            border-color: #f87171;
+        }
+
+        .meeting-checkbox:checked::after {
+            content: '✓';
+            color: white;
+            font-size: 11px;
+            font-weight: 700;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div style="display: flex; flex-direction: column; gap: 4px;">
+            <div class="user-info" id="userNameLabel">Loading...</div>
+            <div class="sync-badge" id="syncStatusContainer">
+                <span id="syncStatusDot" class="sync-dot online"></span>
+                <span id="syncStatusText" style="font-size: 10px; color: var(--text-muted); font-weight: 700; text-transform: uppercase;" data-i18n="status_online">Online & Synced</span>
+            </div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 15px;">
+            <select id="langSelect">
+                <option value="ar">العربية</option>
+                <option value="en">English</option>
+            </select>
+            <button class="logout-btn" id="logoutBtn" data-i18n="logout">Logout</button>
+        </div>
+    </div>
+
+    <div class="main">
+        <div class="timer" id="timerDisplay">00:00:00</div>
+        
+        <div class="progress-bar-bg">
+            <div id="dailyProgressBar" style="width:0%; height:100%; background: linear-gradient(90deg, var(--primary) 0%, #10b981 100%); box-shadow: 0 0 6px #10b981; transition:width 0.5s;"></div>
+        </div>
+        <div id="progressText" style="font-size:11px; font-weight:700; color:var(--text-light); margin-bottom:24px; text-transform: uppercase; letter-spacing: 0.5px;" data-i18n="today_progress">Today's progress: 0 / 8 hours</div>
+        
+        <div style="display:flex; flex-direction:column; gap:10px; margin-bottom: 20px; align-items:center;">
+            <select id="taskSelect" style="width:260px; padding:12px; border-radius:var(--radius-md); border:1.5px solid var(--border-color); background:rgba(17, 24, 39, 0.6); color:#fff; font-size:13px; outline:none; transition:all 0.2s;">
+                <option value="" data-i18n="select_task">-- Choose Task --</option>
+                <option value="general_work" data-i18n="general_work">General Work / عمل عام</option>
+            </select>
+            <input type="text" id="taskTitle" placeholder="What are you working on now? (optional)" data-i18n-placeholder="placeholder_task" autocomplete="off" style="margin-bottom:0; width:260px;">
+        </div>
+
+        <div style="display:flex; align-items:center; margin-bottom: 28px;">
+            <label style="font-size:13px; font-weight:700; color:#ef4444; display:flex; align-items:center; cursor:pointer; text-transform: uppercase; letter-spacing: 0.3px;">
+                <input type="checkbox" id="meetingModeToggle" class="meeting-checkbox">
+                <span data-i18n="meeting_mode">Meeting mode (ignore idle) 🤝</span>
+            </label>
+        </div>
+
+        <button class="track-btn" id="trackBtn">
+            <span id="btnIcon" style="font-size: 28px; margin-bottom: 4px;">▶</span>
+            <span id="btnText" style="font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px;">Start</span>
+        </button>
+        <div class="status-text" id="statusText">Ready to track</div>
+
+        <!-- Focus Mode Card -->
+        <div id="focusModeCard" style="background: rgba(17, 24, 39, 0.7); border: 1.5px solid var(--border-color); border-radius: var(--radius-lg); padding: 16px; width: 260px; margin-top: 24px; display: flex; flex-direction: column; align-items: center; gap: 10px; backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); box-shadow: 0 4px 20px rgba(0,0,0,0.15); transition: all 0.3s ease;">
+            <div style="font-family: 'Poppins', sans-serif; font-size: 13px; font-weight: 700; color: #fff; letter-spacing: 0.5px; text-transform: uppercase; display: flex; align-items: center; gap: 6px;">
+                <span>🧠</span> <span id="focusCardTitle" data-i18n="focus_mode_title">Focus Session</span>
+            </div>
+            <div id="focusTimerDisplay" style="font-family: 'Share Tech Mono', monospace; font-size: 32px; font-weight: 700; color: #3b82f6; text-shadow: 0 0 10px rgba(59, 130, 246, 0.4); letter-spacing: 1px;">25:00</div>
+            <button id="focusToggleBtn" style="width: 100%; border: none; padding: 10px; border-radius: var(--radius-md); background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); color: white; font-weight: 700; font-size: 12px; cursor: pointer; transition: all 0.2s; text-transform: uppercase; outline: none; box-shadow: 0 4px 12px rgba(59, 130, 246, 0.2);">
+                <span id="focusBtnText" data-i18n="start_focus">Start Pomodoro</span>
+            </button>
+        </div>
+    </div>
+
+    <!-- Anti Cheat Overlay -->
+    <div id="antiCheatOverlay" style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(11,15,25,0.96); z-index:9999; justify-content:center; align-items:center; flex-direction:column; color:white; text-align:center; backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px);">
+        <h2 style="color:#ef4444; margin-bottom:8px; font-family:'Poppins', sans-serif; font-size:28px; font-weight:800; letter-spacing:-0.5px;" data-i18n="captcha_title">⚠️ Presence Verification</h2>
+        <p style="margin-bottom:24px; font-size:14px; color:var(--text-muted); max-width:320px; line-height:1.5;" data-i18n="captcha_desc">Please enter the code below within 60 seconds to prove you are active and not using mouse jigglers.</p>
+        
+        <div id="captchaCode" style="font-family:'Share Tech Mono', monospace; font-size:36px; font-weight:bold; letter-spacing:8px; background:rgba(255,255,255,0.04); border:1px solid var(--border-color); padding:12px 28px; border-radius:var(--radius-md); margin-bottom:24px; color:#fff; text-shadow:0 0 10px rgba(255,255,255,0.2);">1234</div>
+        
+        <input type="text" id="captchaInput" autocomplete="off" style="font-size:24px; font-family:'Share Tech Mono', monospace; text-align:center; padding:10px; border-radius:var(--radius-md); border:1.5px solid var(--border-color); width:160px; margin-bottom:24px; background:rgba(17,24,39,0.5); color:#fff;" placeholder="----" />
+        
+        <button id="verifyCaptchaBtn" style="background:linear-gradient(135deg, #10b981 0%, #059669 100%); color:white; border:none; padding:14px 32px; font-size:14px; font-weight:700; border-radius:var(--radius-md); cursor:pointer; text-transform:uppercase; letter-spacing:0.5px; box-shadow:0 4px 12px rgba(16, 185, 129, 0.25);" data-i18n="captcha_verify_btn_init">Verify my identity</button>
+    </div>
+
+    <script src="../js/i18n.js"></script>
+    <script src="../js/tracker-renderer.js"></script>
+</body>
+</html>

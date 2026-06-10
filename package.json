@@ -1,0 +1,45 @@
+{
+  "name": "omega-tracker",
+  "productName": "Omega Tracker",
+  "version": "1.0.0",
+  "description": "Desktop tracking client for Omega Track",
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "electron .",
+    "clean": "if exist dist rmdir /s /q dist",
+    "build": "npm run clean && electron-builder --win",
+    "build:all": "npm run clean && electron-builder --win --mac --linux"
+  },
+  "build": {
+    "appId": "com.omegatrack.tracker",
+    "productName": "Omega Tracker",
+    "copyright": "© 2026 Omega Track",
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "installerIcon": "assets/icon.ico"
+    }
+  },
+  "author": "Omega Track",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "electron-updater": "^6.8.3",
+    "screenshot-desktop": "^1.15.3"
+  },
+  "devDependencies": {
+    "electron": "^29.0.0",
+    "electron-builder": "^24.13.3"
+  }
+}
