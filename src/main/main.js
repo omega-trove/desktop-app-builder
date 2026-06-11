@@ -330,7 +330,7 @@ ipcMain.handle('get-idle-time', () => {
     return powerMonitor.getSystemIdleTime();
 });
 
-// Get real active OS window title (Windows Only MVP)
+// Get real active OS window title
 ipcMain.handle('get-active-window', () => {
     return new Promise((resolve) => {
         if (process.platform === 'win32') {
@@ -361,9 +361,36 @@ $sb.ToString()
             } catch (err) {
                 resolve('Unknown Window');
             }
+        } else if (process.platform === 'darwin') {
+            const script = `tell application "System Events"
+                try
+                    set frontmostProcess to first process whose frontmost is true
+                    set procName to name of frontmostProcess
+                    try
+                        set winTitle to name of first window of frontmostProcess
+                    on error
+                        set winTitle to ""
+                    end try
+                    if winTitle is not "" then
+                        return procName & " - " & winTitle
+                    else
+                        return procName
+                    end if
+                on error
+                    return "Unknown Window"
+                end try
+            end tell`;
+            const escapedScript = script.replace(/'/g, "'\\''");
+            exec(`osascript -e '${escapedScript}'`, (error, stdout) => {
+                if (error) {
+                    resolve('Unknown Window');
+                } else {
+                    resolve(stdout ? stdout.trim() : 'Unknown Window');
+                }
+            });
         } else {
-            // MacOS / Linux fallback for now
-            resolve('Unknown Window (Not Windows OS)');
+            // Linux fallback for now
+            resolve('Unknown Window (Not Supported OS)');
         }
     });
 });
@@ -448,7 +475,7 @@ ipcMain.on('set-locale', (event, locale) => {
     appLocale = (locale === 'ar') ? 'ar' : 'en';
 });
 
-// Minimize foreground active window (Windows Only)
+// Minimize foreground active window
 ipcMain.handle('minimize-active-window', () => {
     return new Promise((resolve) => {
         if (process.platform === 'win32') {
@@ -472,15 +499,44 @@ $hwnd = [Win32]::GetForegroundWindow();
             } catch (err) {
                 resolve(false);
             }
+        } else if (process.platform === 'darwin') {
+            const script = `tell application "System Events"
+                try
+                    set frontmostProcess to first process whose frontmost is true
+                    set procName to name of frontmostProcess
+                    try
+                        tell application procName to set miniaturized of window 1 to true
+                    on error
+                        try
+                            set value of attribute "AXMinimized" of window 1 of process procName to true
+                        on error
+                            try
+                                set collapsed of window 1 of process procName to true
+                            end try
+                        end try
+                    end try
+                    return "success"
+                on error
+                    return "failed"
+                end try
+            end tell`;
+            const escapedScript = script.replace(/'/g, "'\\''");
+            exec(`osascript -e '${escapedScript}'`, (error, stdout) => {
+                if (error) {
+                    resolve(false);
+                } else {
+                    resolve(stdout && stdout.trim() === 'success');
+                }
+            });
         } else {
             resolve(false);
         }
     });
 });
 
-// Force-close the foreground active window (Windows Only).
+// Force-close the foreground active window
 // Used to enforce per-employee 'distracting' productivity rules: when a blocked
-// app/website is opened we gracefully close its window (WM_CLOSE) and the
+// app/website is opened we gracefully close its window and the
 // renderer then completely stops the tracking timer.
 ipcMain.handle('close-active-window', () => {
     return new Promise((resolve) => {
@@ -505,6 +561,29 @@ $hwnd = [Win32Close]::GetForegroundWindow();
             } catch (err) {
                 resolve(false);
             }
+        } else if (process.platform === 'darwin') {
+            const script = `tell application "System Events"
+                try
+                    set frontmostProcess to first process whose frontmost is true
+                    set procName to name of frontmostProcess
+                    try
+                        tell application procName to close window 1
+                    on error
+                        tell application procName to quit
+                    end try
+                    return "success"
+                on error
+                    return "failed"
+                end try
+            end tell`;
+            const escapedScript = script.replace(/'/g, "'\\''");
+            exec(`osascript -e '${escapedScript}'`, (error, stdout) => {
+                if (error) {
+                    resolve(false);
+                } else {
+                    resolve(stdout && stdout.trim() === 'success');
+                }
+            });
         } else {
             resolve(false);
         }
