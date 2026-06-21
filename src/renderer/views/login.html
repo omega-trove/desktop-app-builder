@@ -4,6 +4,24 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Omega Track - Login</title>
+    <script>
+        window.onerror = function (message, source, lineno, colno, error) {
+            const errInfo = "Uncaught Error: " + message + "\nSource: " + source + "\nLine: " + lineno + ":" + colno + "\nStack: " + (error ? error.stack : 'none');
+            console.error(errInfo);
+            if (window.electronAPI && window.electronAPI.logError) {
+                window.electronAPI.logError(errInfo);
+            }
+            alert(errInfo);
+        };
+        window.addEventListener('unhandledrejection', function (event) {
+            const errInfo = "Unhandled Rejection: " + event.reason + "\nStack: " + (event.reason && event.reason.stack ? event.reason.stack : 'none');
+            console.error(errInfo);
+            if (window.electronAPI && window.electronAPI.logError) {
+                window.electronAPI.logError(errInfo);
+            }
+            alert(errInfo);
+        });
+    </script>
     
     <!-- Premium Cross-Platform Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">

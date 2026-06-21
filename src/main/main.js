@@ -728,4 +728,8 @@ ipcMain.on('confirm-close', () => {
     app.exit(0);
 });
 
+ipcMain.on('log-error', (event, msg) => {
+    console.error('❌ [Renderer Error]:', msg);
+});
+
 console.log('🚀 Omega Tracker Main Process Started Successfully');

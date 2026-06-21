@@ -58,7 +58,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     setAntiCheatActive: (active) => ipcRenderer.send('set-anti-cheat-active', active),
 
     // Persistent distraction warning lock (always-on-top focus trap).
-    setDistractionLock: (active) => ipcRenderer.send('set-distraction-lock', active)
+    setDistractionLock: (active) => ipcRenderer.send('set-distraction-lock', active),
+
+    logError: (msg) => ipcRenderer.send('log-error', msg)
 });
 
 console.log('✅ Preload script loaded successfully - ElectronAPI exposed');
