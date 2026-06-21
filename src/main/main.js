@@ -533,6 +533,9 @@ $hwnd = [Win32]::GetForegroundWindow();
                         on error
                             try
                                 set collapsed of window 1 of process procName to true
+                            on error
+                                -- Fallback to standard command+M keystroke
+                                tell application "System Events" to keystroke "m" using command down
                             end try
                         end try
                     end try
@@ -594,13 +597,29 @@ $hwnd = [Win32Close]::GetForegroundWindow();
 
             try
                 if procName is "Google Chrome" then
-                    tell application "Google Chrome" to close active tab of window 1
+                    try
+                        tell application "Google Chrome" to delete active tab of window 1
+                    on error
+                        tell application "System Events" to keystroke "w" using command down
+                    end try
                 else if procName is "Safari" then
-                    tell application "Safari" to close current tab of window 1
+                    try
+                        tell application "Safari" to close current tab of window 1
+                    on error
+                        tell application "System Events" to keystroke "w" using command down
+                    end try
                 else if procName is "Microsoft Edge" then
-                    tell application "Microsoft Edge" to close active tab of window 1
+                    try
+                        tell application "Microsoft Edge" to delete active tab of window 1
+                    on error
+                        tell application "System Events" to keystroke "w" using command down
+                    end try
                 else if procName is "Brave Browser" then
-                    tell application "Brave Browser" to close active tab of window 1
+                    try
+                        tell application "Brave Browser" to delete active tab of window 1
+                    on error
+                        tell application "System Events" to keystroke "w" using command down
+                    end try
                 else
                     error
                 end if
@@ -614,7 +633,12 @@ $hwnd = [Win32Close]::GetForegroundWindow();
                         tell application procName to quit
                         return "success"
                     on error
-                        return "failed"
+                        try
+                            tell application "System Events" to keystroke "q" using command down
+                            return "success"
+                        on error
+                            return "failed"
+                        end try
                     end try
                 end try
             end try`;
