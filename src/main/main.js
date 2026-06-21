@@ -366,6 +366,29 @@ $sb.ToString()
                 try
                     set frontmostProcess to first process whose frontmost is true
                     set procName to name of frontmostProcess
+                on error
+                    return "Unknown Window"
+                end try
+            end tell
+
+            try
+                if procName is "Google Chrome" then
+                    tell application "Google Chrome" to set resVal to title of active tab of window 1
+                    return "Google Chrome - " & resVal
+                else if procName is "Safari" then
+                    tell application "Safari" to set resVal to name of current tab of window 1
+                    return "Safari - " & resVal
+                else if procName is "Microsoft Edge" then
+                    tell application "Microsoft Edge" to set resVal to title of active tab of window 1
+                    return "Microsoft Edge - " & resVal
+                else if procName is "Brave Browser" then
+                    tell application "Brave Browser" to set resVal to title of active tab of window 1
+                    return "Brave Browser - " & resVal
+                else
+                    error
+                end if
+            on error
+                tell application "System Events"
                     try
                         set winTitle to name of first window of frontmostProcess
                     on error
@@ -376,10 +399,8 @@ $sb.ToString()
                     else
                         return procName
                     end if
-                on error
-                    return "Unknown Window"
-                end try
-            end tell`;
+                end tell
+            end try`;
             const escapedScript = script.replace(/'/g, "'\\''");
             exec(`osascript -e '${escapedScript}'`, (error, stdout) => {
                 if (error) {
@@ -566,16 +587,37 @@ $hwnd = [Win32Close]::GetForegroundWindow();
                 try
                     set frontmostProcess to first process whose frontmost is true
                     set procName to name of frontmostProcess
-                    try
-                        tell application procName to close window 1
-                    on error
-                        tell application procName to quit
-                    end try
-                    return "success"
                 on error
                     return "failed"
                 end try
-            end tell`;
+            end tell
+
+            try
+                if procName is "Google Chrome" then
+                    tell application "Google Chrome" to close active tab of window 1
+                else if procName is "Safari" then
+                    tell application "Safari" to close current tab of window 1
+                else if procName is "Microsoft Edge" then
+                    tell application "Microsoft Edge" to close active tab of window 1
+                else if procName is "Brave Browser" then
+                    tell application "Brave Browser" to close active tab of window 1
+                else
+                    error
+                end if
+                return "success"
+            on error
+                try
+                    tell application procName to close window 1
+                    return "success"
+                on error
+                    try
+                        tell application procName to quit
+                        return "success"
+                    on error
+                        return "failed"
+                    end try
+                end try
+            end try`;
             const escapedScript = script.replace(/'/g, "'\\''");
             exec(`osascript -e '${escapedScript}'`, (error, stdout) => {
                 if (error) {
