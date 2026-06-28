@@ -645,8 +645,8 @@ function incrementAndDisplay() {
 async function syncTelemetry() {
     if (!isTracking || !timeLogId) return;
 
+    // 1. Capture Screens via Electron native desktopCapturer (isolated try-catch)
     try {
-        // 1. Capture Screens via Electron native desktopCapturer
         const base64Images = await window.electronAPI.captureScreen();
         if (Array.isArray(base64Images)) {
             for (let i = 0; i < base64Images.length; i++) {
@@ -655,68 +655,83 @@ async function syncTelemetry() {
         } else if (base64Images) {
             await uploadScreenshot(base64Images, 0);
         }
-
-        // 2. Upload dummy App Activity
-        // In reality, active-win native module would be called here via IPC
-        uploadActivity();
-
-        // 3. Track and upload GPS / Geo-IP Location
-        trackLocation();
-
     } catch (e) {
-        console.error("Sync error:", e);
+        console.error("Screenshot capture/sync error:", e);
+    }
+
+    // 2. Upload App Activity (isolated try-catch)
+    try {
+        uploadActivity();
+    } catch (e) {
+        console.error("Activity upload error:", e);
+    }
+
+    // 3. Track and upload GPS / Geo-IP Location (isolated try-catch)
+    try {
+        trackLocation();
+    } catch (e) {
+        console.error("Location track error:", e);
     }
 }
 
 async function uploadScreenshot(base64Image, screenIndex = 0) {
-    // Convert base64 to Blob
-    const response = await fetch(base64Image);
-    const blob = await response.blob();
-    
-    let formData = new FormData();
-    formData.append('time_log_id', timeLogId);
-    formData.append('image', blob, `shot_${Date.now()}_${screenIndex}.jpg`);
-    formData.append('activity_percentage', Math.floor(Math.random() * 40) + 60); // Fake 60-100% active
-    
-    // Dynamically retrieve active window for the screenshot metadata
-    const activeWin = await window.electronAPI.getActiveWindow();
-    const displayIndexText = ` [Screen ${screenIndex + 1}]`;
-    formData.append('window_title', (activeWin || 'Omega Tracker Target') + displayIndexText);
-
     try {
-        const res = await fetchWithAuth(`${API_BASE}/tracking/screenshot`, {
-            method: 'POST',
-            body: formData,
-            timeoutMs: 60000 // image upload — allow longer than the default
-        });
+        // Convert base64 to Blob
+        const response = await fetch(base64Image);
+        const blob = await response.blob();
+        
+        let formData = new FormData();
+        formData.append('time_log_id', timeLogId);
+        formData.append('image', blob, `shot_${Date.now()}_${screenIndex}.jpg`);
+        formData.append('activity_percentage', Math.floor(Math.random() * 40) + 60); // Fake 60-100% active
+        
+        // Dynamically retrieve active window for the screenshot metadata
+        let activeWin = 'Unknown Window';
+        try {
+            activeWin = await window.electronAPI.getActiveWindow();
+        } catch (winErr) {
+            console.warn("Failed to get active window for screenshot:", winErr);
+        }
+        const displayIndexText = ` [Screen ${screenIndex + 1}]`;
+        formData.append('window_title', (activeWin || 'Omega Tracker Target') + displayIndexText);
 
-        if(!res.ok) throw new Error('HTTP Status ' + res.status);
-    } catch(err) {
-        console.warn("Offline! Encrypting and buffering to IndexedDB:", err.message);
-        if(offlineDb) {
-            try {
-                const cryptoKey = await getCryptoKey(token);
-                const arrayBuffer = await blob.arrayBuffer();
-                const iv = crypto.getRandomValues(new Uint8Array(12));
-                const encrypted = await crypto.subtle.encrypt(
-                    { name: 'AES-GCM', iv: iv },
-                    cryptoKey,
-                    arrayBuffer
-                );
-                
-                const tx = offlineDb.transaction('offline_screenshots', 'readwrite');
-                tx.objectStore('offline_screenshots').add({
-                    time_log_id: timeLogId,
-                    encrypted_image: encrypted,
-                    iv: iv,
-                    activity_percentage: formData.get('activity_percentage'),
-                    window_title: formData.get('window_title'),
-                    timestamp: Date.now()
-                });
-            } catch (e) {
-                console.error("Local encryption buffering failed:", e);
+        try {
+            const res = await fetchWithAuth(`${API_BASE}/tracking/screenshot`, {
+                method: 'POST',
+                body: formData,
+                timeoutMs: 60000 // image upload — allow longer than the default
+            });
+
+            if(!res.ok) throw new Error('HTTP Status ' + res.status);
+        } catch(err) {
+            console.warn("Offline! Encrypting and buffering to IndexedDB:", err.message);
+            if(offlineDb) {
+                try {
+                    const cryptoKey = await getCryptoKey(token);
+                    const arrayBuffer = await blob.arrayBuffer();
+                    const iv = crypto.getRandomValues(new Uint8Array(12));
+                    const encrypted = await crypto.subtle.encrypt(
+                        { name: 'AES-GCM', iv: iv },
+                        cryptoKey,
+                        arrayBuffer
+                    );
+                    
+                    const tx = offlineDb.transaction('offline_screenshots', 'readwrite');
+                    tx.objectStore('offline_screenshots').add({
+                        time_log_id: timeLogId,
+                        encrypted_image: encrypted,
+                        iv: iv,
+                        activity_percentage: formData.get('activity_percentage'),
+                        window_title: formData.get('window_title'),
+                        timestamp: Date.now()
+                    });
+                } catch (e) {
+                    console.error("Local encryption buffering failed:", e);
+                }
             }
         }
+    } catch (globalErr) {
+        console.error("Global uploadScreenshot error:", globalErr);
     }
 }
 
