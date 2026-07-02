@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, powerMonitor, desktopCapturer, Tray, Menu, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, powerMonitor, desktopCapturer, Tray, Menu, dialog, nativeImage, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { exec: _rawExec } = require('child_process');
@@ -26,8 +26,52 @@ let isQuitting = false;
 let isTracking = false;   // mirrored from the renderer (counter running or not)
 let appLocale = 'ar';     // mirrored from the renderer UI language (for native dialogs)
 
+let activeWindowTitle = 'Unknown Window';
+let windowTrackerProcess = null;
+
+function startWindowTracker() {
+    if (process.platform !== 'win32') return;
+    
+    try {
+        const trackerPath = path.join(__dirname, 'window-tracker.exe');
+        if (fs.existsSync(trackerPath)) {
+            const { spawn } = require('child_process');
+            windowTrackerProcess = spawn(trackerPath, [], {
+                stdio: ['ignore', 'pipe', 'ignore']
+            });
+
+            windowTrackerProcess.stdout.on('data', (data) => {
+                const line = data.toString('utf8').trim();
+                if (line) {
+                    activeWindowTitle = line;
+                }
+            });
+
+            windowTrackerProcess.on('error', (err) => {
+                console.error('❌ Window tracker process error:', err);
+            });
+
+            windowTrackerProcess.on('exit', (code) => {
+                console.log(`ℹ️ Window tracker process exited with code ${code}`);
+                // Restart it if it wasn't intentionally killed
+                if (!isQuitting) {
+                    setTimeout(startWindowTracker, 5000);
+                }
+            });
+        } else {
+            console.warn('⚠️ window-tracker.exe not found at:', trackerPath);
+        }
+    } catch (err) {
+        console.error('❌ Failed to spawn window-tracker.exe:', err);
+    }
+}
+
 // Force-kill any tracked native child processes.
 function killAllChildren() {
+    if (windowTrackerProcess) {
+        try { windowTrackerProcess.kill(); } catch (e) {}
+        windowTrackerProcess = null;
+    }
     for (const cp of childProcesses) {
         try { cp.kill('SIGKILL'); } catch (e) { /* already exited */ }
     }
@@ -183,8 +227,19 @@ function createWindow() {
 }
 
 function createTray() {
-    const iconPath = path.join(__dirname, '../../assets/icon.ico');
-    tray = new Tray(iconPath);
+    let icon;
+    if (process.platform === 'win32') {
+        const iconPath = path.join(__dirname, '../../assets/icon.ico');
+        icon = nativeImage.createFromPath(iconPath);
+    } else {
+        // macOS / Linux: Load PNG, resize to standard menu bar dimensions (22x22)
+        const iconPath = path.join(__dirname, '../../assets/icon.png');
+        icon = nativeImage.createFromPath(iconPath).resize({ width: 22, height: 22 });
+        if (process.platform === 'darwin') {
+            icon.setTemplateImage(true); // Automatically adapt to Light/Dark menu bar theme
+        }
+    }
+    tray = new Tray(icon);
     
     const contextMenu = Menu.buildFromTemplate([
         { 
@@ -219,8 +274,11 @@ function createTray() {
     });
 }
 
-// Disable hardware acceleration (fixes screenshot issues on Windows)
-app.disableHardwareAcceleration();
+// Disable hardware acceleration only on Windows to avoid black screen screenshot issues,
+// while keeping it active on macOS/Linux for smooth UI rendering performance.
+if (process.platform === 'win32') {
+    app.disableHardwareAcceleration();
+}
 
 app.whenReady().then(() => {
     loadConfig();        // Load API config first
@@ -243,6 +301,9 @@ app.whenReady().then(() => {
 
     createWindow();
     createTray();
+
+    // Start background native window tracker (Windows only)
+    startWindowTracker();
 
     app.on('activate', () => {
         if (BrowserWindow.getAllWindows().length === 0) {
@@ -332,8 +393,12 @@ ipcMain.handle('get-idle-time', () => {
 
 // Get real active OS window title
 ipcMain.handle('get-active-window', () => {
-    return new Promise((resolve) => {
-        if (process.platform === 'win32') {
+    if (process.platform === 'win32') {
+        if (windowTrackerProcess && !windowTrackerProcess.killed) {
+            return activeWindowTitle;
+        }
+        // Self-Healing Fallback: If the compiled helper is missing or crashed, use PowerShell as backup
+        return new Promise((resolve) => {
             const psScript = `
 Add-Type -TypeDefinition '
 using System;
@@ -361,59 +426,63 @@ $sb.ToString()
             } catch (err) {
                 resolve('Unknown Window');
             }
-        } else if (process.platform === 'darwin') {
-            const script = `tell application "System Events"
-                try
-                    set frontmostProcess to first process whose frontmost is true
-                    set procName to name of frontmostProcess
-                on error
-                    return "Unknown Window"
-                end try
-            end tell
-
-            try
-                if procName is "Google Chrome" then
-                    tell application "Google Chrome" to set resVal to title of active tab of window 1
-                    return "Google Chrome - " & resVal
-                else if procName is "Safari" then
-                    tell application "Safari" to set resVal to name of current tab of window 1
-                    return "Safari - " & resVal
-                else if procName is "Microsoft Edge" then
-                    tell application "Microsoft Edge" to set resVal to title of active tab of window 1
-                    return "Microsoft Edge - " & resVal
-                else if procName is "Brave Browser" then
-                    tell application "Brave Browser" to set resVal to title of active tab of window 1
-                    return "Brave Browser - " & resVal
-                else
-                    error
-                end if
-            on error
-                tell application "System Events"
+        });
+    } else {
+        return new Promise((resolve) => {
+            if (process.platform === 'darwin') {
+                const script = `tell application "System Events"
                     try
-                        set winTitle to name of first window of frontmostProcess
+                        set frontmostProcess to first process whose frontmost is true
+                        set procName to name of frontmostProcess
                     on error
-                        set winTitle to ""
+                        return "Unknown Window"
                     end try
-                    if winTitle is not "" then
-                        return procName & " - " & winTitle
-                    else
-                        return procName
-                    end if
                 end tell
-            end try`;
-            const escapedScript = script.replace(/'/g, "'\\''");
-            exec(`osascript -e '${escapedScript}'`, (error, stdout) => {
-                if (error) {
-                    resolve('Unknown Window');
-                } else {
-                    resolve(stdout ? stdout.trim() : 'Unknown Window');
-                }
-            });
-        } else {
-            // Linux fallback for now
-            resolve('Unknown Window (Not Supported OS)');
-        }
-    });
+
+                try
+                    if procName is "Google Chrome" then
+                        tell application "Google Chrome" to set resVal to title of active tab of window 1
+                        return "Google Chrome - " & resVal
+                    else if procName is "Safari" then
+                        tell application "Safari" to set resVal to name of current tab of window 1
+                        return "Safari - " & resVal
+                    else if procName is "Microsoft Edge" then
+                        tell application "Microsoft Edge" to set resVal to title of active tab of window 1
+                        return "Microsoft Edge - " & resVal
+                    else if procName is "Brave Browser" then
+                        tell application "Brave Browser" to set resVal to title of active tab of window 1
+                        return "Brave Browser - " & resVal
+                    else
+                        error
+                    end if
+                on error
+                    tell application "System Events"
+                        try
+                            set winTitle to name of first window of frontmostProcess
+                        on error
+                            set winTitle to ""
+                        end try
+                        if winTitle is not "" then
+                            return procName & " - " & winTitle
+                        else
+                            return procName
+                        end if
+                    end tell
+                end try`;
+                const escapedScript = script.replace(/'/g, "'\\''");
+                exec(`osascript -e '${escapedScript}'`, (error, stdout) => {
+                    if (error) {
+                        resolve('Unknown Window');
+                    } else {
+                        resolve(stdout ? stdout.trim() : 'Unknown Window');
+                    }
+                });
+            } else {
+                // Linux fallback for now
+                resolve('Unknown Window (Not Supported OS)');
+            }
+        });
+    }
 });
 
 // Get Native OS Geolocation (Windows PowerShell watcher)
@@ -468,6 +537,16 @@ ipcMain.on('navigate-to', (event, page) => {
         mainWindow.setAlwaysOnTop(false);
         mainWindow.setMinimizable(true);
         mainWindow.flashFrame(false);
+
+        // Safely close the floating reminder popup window on logout
+        if (reminderWindow && !reminderWindow.isDestroyed()) {
+            try {
+                reminderWindow.close();
+            } catch (e) {
+                console.error('Error closing reminder window on logout:', e);
+            }
+            reminderWindow = null;
+        }
     }
 
     mainWindow.loadFile(path.join(__dirname, `../renderer/views/${page}.html`));
@@ -476,13 +555,56 @@ ipcMain.on('navigate-to', (event, page) => {
 // Optional: Send API_BASE to renderer on demand
 ipcMain.handle('get-api-base', () => config.API_BASE);
 
-// Secure Identity Token Storage
-ipcMain.handle('get-token', () => authSessionToken);
+// Secure Identity Token Storage (with safeStorage encryption on disk)
+const secureTokenPath = path.join(app.getPath('userData'), 'session_token.enc');
+
+ipcMain.handle('get-token', () => {
+    if (authSessionToken) return authSessionToken;
+    
+    try {
+        if (fs.existsSync(secureTokenPath)) {
+            const encryptedBuffer = fs.readFileSync(secureTokenPath);
+            if (safeStorage.isEncryptionAvailable()) {
+                authSessionToken = safeStorage.decryptString(encryptedBuffer);
+            } else {
+                authSessionToken = encryptedBuffer.toString('utf8');
+            }
+            return authSessionToken;
+        }
+    } catch (err) {
+        console.error('❌ Failed to decrypt secure token from disk:', err);
+    }
+    return null;
+});
+
 ipcMain.on('set-token', (event, token) => {
     authSessionToken = token;
+    try {
+        const dir = path.dirname(secureTokenPath);
+        if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+        
+        if (safeStorage.isEncryptionAvailable()) {
+            const encryptedBuffer = safeStorage.encryptString(token);
+            fs.writeFileSync(secureTokenPath, encryptedBuffer);
+        } else {
+            fs.writeFileSync(secureTokenPath, Buffer.from(token, 'utf8'));
+        }
+    } catch (err) {
+        console.error('❌ Failed to encrypt and save secure token to disk:', err);
+    }
 });
+
 ipcMain.on('clear-token', () => {
     authSessionToken = null;
+    try {
+        if (fs.existsSync(secureTokenPath)) {
+            fs.unlinkSync(secureTokenPath);
+        }
+    } catch (err) {
+        console.error('❌ Failed to delete secure token from disk:', err);
+    }
 });
 
 // Renderer mirrors the counter state here so the close handler knows whether
@@ -656,7 +778,7 @@ $hwnd = [Win32Close]::GetForegroundWindow();
     });
 });
 
-// Simulate OS-level Mouse Click at coordinates (Windows Only)
+// Simulate OS-level Mouse Click at coordinates (Windows & macOS)
 ipcMain.handle('simulate-mouse-click', (event, { x, y }) => {
     return new Promise((resolve) => {
         if (process.platform === 'win32') {
@@ -676,6 +798,16 @@ public class Win32Mouse {
             try {
                 const base64 = Buffer.from(psScript, 'utf-16le').toString('base64');
                 exec(`powershell -NoProfile -NonInteractive -EncodedCommand ${base64}`, (error) => {
+                    resolve(!error);
+                });
+            } catch (err) {
+                resolve(false);
+            }
+        } else if (process.platform === 'darwin') {
+            try {
+                // macOS: Use JavaScript for Automation (JXA) to call native CoreGraphics APIs
+                const jxaScript = `ObjC.import('CoreGraphics'); var point = {x: ${x}, y: ${y}}; var clickDown = $.CGEventCreateMouseEvent(null, $.kCGEventLeftMouseDown, point, $.kCGMouseButtonLeft); var clickUp = $.CGEventCreateMouseEvent(null, $.kCGEventLeftMouseUp, point, $.kCGMouseButtonLeft); $.CGEventPost($.kCGHIDEventTap, clickDown); $.CGEventPost($.kCGHIDEventTap, clickUp);`;
+                exec(`osascript -l JavaScript -e "${jxaScript}"`, (error) => {
                     resolve(!error);
                 });
             } catch (err) {

@@ -13,6 +13,7 @@ let offlineSessionStartTime = null;
 let streamActive = false;
 let streamInterval = null;
 let shouldStreamCheckInterval = null;
+let currentPollRate = 10000; // Default to 10s when idle/not streaming
 
 // WebRTC Streaming Params
 let webrtcPeerConnection = null;
@@ -93,7 +94,6 @@ document.getElementById('logoutBtn').addEventListener('click', () => {
     try { dismissDistractionWarning(); } catch (e) {}
     if (distractionGuardInterval) { clearInterval(distractionGuardInterval); distractionGuardInterval = null; }
     if (rulesRefreshInterval) { clearInterval(rulesRefreshInterval); rulesRefreshInterval = null; }
-    localStorage.removeItem('auth_token');
     localStorage.removeItem('user_name');
     window.electronAPI.clearToken();
     window.electronAPI.navigateTo('login');
@@ -142,7 +142,6 @@ async function fetchWithAuth(url, options = {}) {
                 console.error('Error stopping tracking during 401 redirect:', e);
             }
         }
-        localStorage.removeItem('auth_token');
         localStorage.removeItem('user_name');
         if (window.electronAPI) {
             window.electronAPI.clearToken();
@@ -262,6 +261,80 @@ async function boot() {
 }
 boot();
 
+async function checkStreamStatus() {
+    if (!isTracking) return;
+    try {
+        const response = await fetchWithAuth(`${API_BASE}/tracking/should-stream`);
+        const data = await response.json();
+        const stream_active = data.stream_active;
+        const webrtc_request = data.webrtc_request;
+        
+        // Enforce Meeting Mode Limit
+        const toggle = document.getElementById('meetingModeToggle');
+        if (data.meeting_mode_limit_exceeded) {
+            if (toggle) {
+                if (toggle.checked) {
+                    toggle.checked = false;
+                    console.warn("Meeting mode limit reached for today. Disabling meeting mode.");
+                    alert("Meeting mode limit reached for today! Mode disabled.");
+                }
+                toggle.disabled = true;
+            }
+        } else {
+            if (toggle) toggle.disabled = false;
+        }
+
+        // Handle Remote Commands (e.g. switch active screen or click)
+        if (data.remote_commands && data.remote_commands.length > 0) {
+            data.remote_commands.forEach(cmd => {
+                if (cmd.type === 'switch_screen') {
+                    console.log(`WebRTC Remote Command: Switch screen to index ${cmd.screen}`);
+                    activeScreenIndex = parseInt(cmd.screen);
+                    if (isStreaming) {
+                        initiateWebRTCStream(); // Restart stream with the new screen
+                    }
+                } else if (cmd.type === 'click') {
+                    const xPercent = parseFloat(cmd.x_percent) || 0;
+                    const yPercent = parseFloat(cmd.y_percent) || 0;
+                    const x = Math.round(xPercent * window.screen.width);
+                    const y = Math.round(yPercent * window.screen.height);
+                    console.log(`WebRTC Remote Click: Simulating mouse click at ${x}, ${y}`);
+                    if (window.electronAPI && window.electronAPI.simulateMouseClick) {
+                        window.electronAPI.simulateMouseClick(x, y);
+                    }
+                }
+            });
+        }
+
+        streamActive = stream_active;
+        if (streamActive) {
+            startMjpegStream();
+        } else {
+            stopMjpegStream();
+        }
+
+        if (webrtc_request && !isStreaming) {
+            initiateWebRTCStream();
+        } else if (!stream_active && isStreaming) {
+            stopWebRTCStream();
+        }
+
+        // Adaptive Polling Rate: Poll faster (3s) when active, slower (10s) when idle
+        const targetRate = (streamActive || isStreaming || webrtc_request) ? 3000 : 10000;
+        if (targetRate !== currentPollRate) {
+            currentPollRate = targetRate;
+            startStreamPolling(); // Re-arm interval with new rate
+        }
+    } catch(e) {
+        console.error('should-stream error:', e);
+    }
+}
+
+function startStreamPolling() {
+    if (shouldStreamCheckInterval) clearInterval(shouldStreamCheckInterval);
+    shouldStreamCheckInterval = setInterval(checkStreamStatus, currentPollRate);
+}
+
 async function startTracking() {
     if (isTracking) return;
     isTracking = true;
@@ -368,69 +441,11 @@ async function startTracking() {
                 progress.style.width = Math.floor(Math.random() * 30 + 70) + '%';
             }
         }, 60000);
-           // -------------------------
+        // -------------------------
         // LIVE VIDEO STREAMING ENGINE (WebRTC & Command Listener)
         // -------------------------
-        shouldStreamCheckInterval = setInterval(async () => {
-            try {
-                const response = await fetchWithAuth(`${API_BASE}/tracking/should-stream`);
-                const data = await response.json();
-                const stream_active = data.stream_active;
-                const webrtc_request = data.webrtc_request;
-                
-                // Enforce Meeting Mode Limit
-                const toggle = document.getElementById('meetingModeToggle');
-                if (data.meeting_mode_limit_exceeded) {
-                    if (toggle) {
-                        if (toggle.checked) {
-                            toggle.checked = false;
-                            console.warn("Meeting mode limit reached for today. Disabling meeting mode.");
-                            alert("Meeting mode limit reached for today! Mode disabled.");
-                        }
-                        toggle.disabled = true;
-                    }
-                } else {
-                    if (toggle) toggle.disabled = false;
-                }
-
-                // Handle Remote Commands (e.g. switch active screen or click)
-                if (data.remote_commands && data.remote_commands.length > 0) {
-                    data.remote_commands.forEach(cmd => {
-                        if (cmd.type === 'switch_screen') {
-                            console.log(`WebRTC Remote Command: Switch screen to index ${cmd.screen}`);
-                            activeScreenIndex = parseInt(cmd.screen);
-                            if (isStreaming) {
-                                initiateWebRTCStream(); // Restart stream with the new screen
-                            }
-                        } else if (cmd.type === 'click') {
-                            const xPercent = parseFloat(cmd.x_percent) || 0;
-                            const yPercent = parseFloat(cmd.y_percent) || 0;
-                            const x = Math.round(xPercent * window.screen.width);
-                            const y = Math.round(yPercent * window.screen.height);
-                            console.log(`WebRTC Remote Click: Simulating mouse click at ${x}, ${y}`);
-                            if (window.electronAPI && window.electronAPI.simulateMouseClick) {
-                                window.electronAPI.simulateMouseClick(x, y);
-                            }
-                        }
-                    });
-                }
-
-                streamActive = stream_active;
-                if (streamActive) {
-                    startMjpegStream();
-                } else {
-                    stopMjpegStream();
-                }
-
-                if (webrtc_request && !isStreaming) {
-                    initiateWebRTCStream();
-                } else if (!stream_active && isStreaming) {
-                    stopWebRTCStream();
-                }
-            } catch(e) {
-                console.error('should-stream error:', e);
-            }
-        }, 5000); // Check every 5 seconds if someone is watching
+        currentPollRate = 10000; // Reset to standard 10s rate on session start
+        startStreamPolling();
         
         // Take immediate initial snapshot
         syncTelemetry();
@@ -1326,7 +1341,28 @@ async function trackLocation() {
     lastLocationTrackTime = now;
     console.log("Attempting to capture GPS location...");
     
-    // 1. Try OS-Native Location Service first
+    // 1. Try HTML5 Geolocation API first (fast, Chromium native, zero process overhead)
+    if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(
+            async (position) => {
+                const lat = position.coords.latitude;
+                const lng = position.coords.longitude;
+                console.log(`GPS Location captured via Geolocation API: ${lat}, ${lng}`);
+                await sendLocationToServer(lat, lng);
+            },
+            async (err) => {
+                console.warn("Geolocation API failed or denied, trying OS-Native Location service...", err);
+                await trackLocationViaNativeOrIp();
+            },
+            { enableHighAccuracy: true, timeout: 5000 }
+        );
+    } else {
+        await trackLocationViaNativeOrIp();
+    }
+}
+
+async function trackLocationViaNativeOrIp() {
+    // 2. Try OS-Native Location Service (Windows PowerShell)
     if (window.electronAPI && window.electronAPI.getNativeLocation) {
         try {
             console.log("Trying OS-Native Geolocation API...");
@@ -1343,30 +1379,14 @@ async function trackLocation() {
                     }
                 }
             }
-            console.warn("OS-Native Geolocation returned unknown or invalid format. Trying HTML5 fallback...");
+            console.warn("OS-Native Geolocation returned unknown or invalid format. Trying Geo-IP fallback...");
         } catch (err) {
-            console.warn("OS-Native Geolocation failed. Trying HTML5 fallback...", err);
+            console.warn("OS-Native Geolocation failed. Trying Geo-IP fallback...", err);
         }
     }
     
-    // 2. Try HTML5 Geolocation API (Chromium / Google Maps Triangulation)
-    if (navigator.geolocation) {
-        navigator.geolocation.getCurrentPosition(
-            async (position) => {
-                const lat = position.coords.latitude;
-                const lng = position.coords.longitude;
-                console.log(`GPS Location captured via Geolocation API: ${lat}, ${lng}`);
-                await sendLocationToServer(lat, lng);
-            },
-            async (err) => {
-                console.warn("Geolocation API failed or denied, trying Geo-IP fallback...", err);
-                await trackLocationViaIp();
-            },
-            { enableHighAccuracy: true, timeout: 5000 }
-        );
-    } else {
-        await trackLocationViaIp();
-    }
+    // 3. Try Geo-IP fallback
+    await trackLocationViaIp();
 }
 
 async function trackLocationViaIp() {
@@ -1592,9 +1612,21 @@ window.addEventListener('keydown', () => {
 });
 
 // AES-GCM Encryption Key Helpers using Web Crypto API
+// AES-GCM Encryption Key Helpers using Web Crypto API
+function getOrCreateMachineKey() {
+    let machineKey = localStorage.getItem('tracker_machine_key');
+    if (!machineKey) {
+        machineKey = 'mk_' + Date.now() + '_' + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+        localStorage.setItem('tracker_machine_key', machineKey);
+    }
+    return machineKey;
+}
+
 async function getCryptoKey(tokenStr) {
+    // Rely on a persistent, unique machine key rather than the transient user token to avoid decryption failures when user sessions expire or change.
+    const keyStr = getOrCreateMachineKey();
     const enc = new TextEncoder();
-    const keyData = enc.encode(tokenStr);
+    const keyData = enc.encode(keyStr);
     const hash = await crypto.subtle.digest('SHA-256', keyData);
     return await crypto.subtle.importKey(
         'raw',

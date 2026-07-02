@@ -20,11 +20,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     const loginBtn = document.getElementById('loginBtn');
     const errorMsg = document.getElementById('errorMsg');
 
-    // Auto-login if token exists
-    const storedToken = localStorage.getItem('auth_token');
+    // Auto-login if secure token exists in the OS Keychain/userData file
+    const storedToken = await window.electronAPI.getToken();
     if (storedToken) {
-        console.log('Found stored token, auto-logging in...');
-        window.electronAPI.setToken(storedToken);
+        console.log('Found secure stored token, auto-logging in...');
         window.electronAPI.navigateTo('tracker');
         return;
     }
@@ -67,14 +66,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             if (response.ok && token) {
                 console.log('✅ Login successful');
-                localStorage.setItem('auth_token', token);
+                window.electronAPI.setToken(token);
                 
                 const fullName = data.user ? data.user.full_name : (data.data && data.data.user ? data.data.user.full_name : null);
                 if (fullName) {
                     localStorage.setItem('user_name', fullName);
                 }
                 
-                window.electronAPI.setToken(token);
                 window.electronAPI.navigateTo('tracker');
             } else {
                 throw new Error(data.message || data.error || __('invalid_credentials'));
