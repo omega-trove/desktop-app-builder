@@ -10,3 +10,7 @@ dist/
 # OS Files
 .DS_Store
 Thumbs.db
+
+# Secrets
+build/secrets.json
+
