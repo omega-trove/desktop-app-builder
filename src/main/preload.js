@@ -60,6 +60,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // Persistent distraction warning lock (always-on-top focus trap).
     setDistractionLock: (active) => ipcRenderer.send('set-distraction-lock', active),
 
+    setAlwaysOnTop: (active) => ipcRenderer.send('set-always-on-top', active),
+
     logError: (msg) => ipcRenderer.send('log-error', msg)
 });
 

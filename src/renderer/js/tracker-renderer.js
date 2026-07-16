@@ -427,7 +427,9 @@ async function startTracking() {
                 const idleSeconds = await window.electronAPI.getIdleTime();
                 if (idleSeconds > IDLE_TIMEOUT_SECONDS && !inMeeting) {
                     console.log(`User idle for ${idleSeconds}s. Stopping tracker automatically.`);
+                    window.electronAPI.setAlwaysOnTop(true);
                     alert(__('idle_stopped', IDLE_TIMEOUT_MINUTES));
+                    window.electronAPI.setAlwaysOnTop(false);
                     stopTracking();
                     return; // Exit the loop
                 }

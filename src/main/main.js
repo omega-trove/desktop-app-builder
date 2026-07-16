@@ -921,6 +921,22 @@ ipcMain.on('set-distraction-lock', (event, active) => {
     }
 });
 
+ipcMain.on('set-always-on-top', (event, active) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+
+    if (active) {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.show();
+        mainWindow.setAlwaysOnTop(true, 'screen-saver');
+        mainWindow.moveTop();
+        mainWindow.focus();
+        mainWindow.flashFrame(true);
+    } else {
+        mainWindow.setAlwaysOnTop(false);
+        mainWindow.flashFrame(false);
+    }
+});
+
 ipcMain.on('confirm-close', () => {
     isQuitting = true;
     app.exit(0);
