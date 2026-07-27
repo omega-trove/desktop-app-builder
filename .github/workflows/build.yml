@@ -35,7 +35,9 @@ jobs:
 
       - name: Install Microsoft Sign CLI (Windows)
         if: matrix.os == 'windows-latest'
-        run: dotnet tool install --global Microsoft.Trusted.Signing.Client || true
+        run: |
+          dotnet tool install --global Microsoft.Trusted.Signing.Client || true
+          echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
         shell: bash
 
       - name: Install Dependencies

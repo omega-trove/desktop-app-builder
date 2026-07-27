@@ -61,8 +61,13 @@ exports.default = async function(configuration) {
         }
     }
 
+    // Determine executable and args for signing
+    let signExecutable = dotnetPath;
     let args = [];
+
     if (signDllPath) {
+        // Run via dotnet host + sign.dll (local SDK / extracted tool)
+        signExecutable = dotnetPath;
         args = [
             signDllPath,
             'code',
@@ -73,8 +78,20 @@ exports.default = async function(configuration) {
             filePath
         ];
     } else {
+        // Check if Microsoft Sign CLI (sign.exe) was installed globally (e.g. in CI)
+        const userProfile = process.env.USERPROFILE || process.env.HOME || '';
+        const globalSignExe = path.join(userProfile, '.dotnet', 'tools', 'sign.exe');
+        const globalSign = path.join(userProfile, '.dotnet', 'tools', 'sign');
+
+        if (fs.existsSync(globalSignExe)) {
+            signExecutable = globalSignExe;
+        } else if (fs.existsSync(globalSign)) {
+            signExecutable = globalSign;
+        } else {
+            signExecutable = 'sign';
+        }
+
         args = [
-            'sign',
             'code',
             'artifact-signing',
             '-ase', 'https://eus.codesigning.azure.net',
@@ -91,8 +108,8 @@ exports.default = async function(configuration) {
         AZURE_CLIENT_SECRET: clientSecret
     };
 
-    console.log(`Running Sign CLI for: ${path.basename(filePath)}...`);
-    const result = spawnSync(dotnetPath, args, { env, stdio: 'inherit' });
+    console.log(`Running Sign CLI (${signExecutable}) for: ${path.basename(filePath)}...`);
+    const result = spawnSync(signExecutable, args, { env, stdio: 'inherit' });
 
     if (result.status !== 0) {
         console.error(`❌ Signing failed for: ${filePath}`);
