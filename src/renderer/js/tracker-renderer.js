@@ -7,6 +7,7 @@ let dailyTargetHours = 8.0;
 let uiInterval = null;
 let trackingInterval = null;
 let rulesRefreshInterval = null;
+let taskListInterval = null;      // always-on periodic refresh of the task dropdown
 let offlineSessionStartTime = null;
 
 // ── HRM → Desktop timer sync ────────────────────────────────────────────────
@@ -109,6 +110,7 @@ document.getElementById('logoutBtn').addEventListener('click', () => {
     if (distractionGuardInterval) { clearInterval(distractionGuardInterval); distractionGuardInterval = null; }
     if (rulesRefreshInterval) { clearInterval(rulesRefreshInterval); rulesRefreshInterval = null; }
     if (timerCommandInterval) { clearInterval(timerCommandInterval); timerCommandInterval = null; }
+    if (taskListInterval) { clearInterval(taskListInterval); taskListInterval = null; }
     externalTimeLogId = null;
     localStorage.removeItem('user_name');
     window.electronAPI.clearToken();
@@ -201,30 +203,64 @@ async function initDailyTime() {
     }
 }
 
+// Fetches the assigned task list and rebuilds the dropdown IN PLACE, preserving
+// whatever the user (or the HRM sync) currently has selected. Runs on boot and
+// on a short always-on interval (see startTaskListSync), so a task created in the
+// web app shows up here within seconds — no app restart required.
 async function loadTasks() {
     try {
         const res = await fetchWithAuth(`${API_BASE}/tracking/tasks`);
         const tasks = await res.json();
-        
+
         const select = document.getElementById('taskSelect');
         if (!select) return;
-        
+
+        // Remember the current selection so a periodic refresh never yanks the
+        // task out from under an in-progress session or a mid-selection user.
+        const prevValue = select.value;
+        const prevSelected = select.options[select.selectedIndex] || null;
+        const prevText = prevSelected ? prevSelected.text : '';
+
         // Keep only "-- Choose Task --" and "General Work"
         while (select.options.length > 2) {
             select.remove(2);
         }
-        
+
+        let matchedPrev = false;
         if (Array.isArray(tasks)) {
             tasks.forEach(task => {
                 const opt = document.createElement('option');
-                opt.value = task.id;
+                opt.value = String(task.id);
                 opt.text = `${task.title} [${task.priority}]`;
                 select.add(opt);
+                if (opt.value === prevValue) matchedPrev = true;
             });
+        }
+
+        // Restore the previous selection. If it was a real task id that the fresh
+        // list no longer contains (e.g. an HRM-mirrored task not in "my tasks", or
+        // one just marked done elsewhere), re-inject it so the active session's
+        // label is never lost while it is still running/selected.
+        if (prevValue && prevValue !== '' && prevValue !== 'general_work' && !matchedPrev) {
+            const keep = document.createElement('option');
+            keep.value = prevValue;
+            keep.text = prevText || prevValue;
+            select.add(keep);
+        }
+        if (prevValue !== null && prevValue !== undefined) {
+            select.value = prevValue;
         }
     } catch (e) {
         console.error('Failed to load tasks:', e);
     }
+}
+
+// Poll the task list on a short interval so newly-created web tasks appear in the
+// dropdown live. Selection is preserved by loadTasks(), so this is safe to run
+// even while a session is active.
+function startTaskListSync() {
+    if (taskListInterval) clearInterval(taskListInterval);
+    taskListInterval = setInterval(loadTasks, 20000);
 }
 
 // Add task selection listener
@@ -450,6 +486,10 @@ async function boot() {
     if (rulesRefreshInterval) clearInterval(rulesRefreshInterval);
     rulesRefreshInterval = setInterval(loadDistractingApps, 30000);
     startDistractionGuard();
+
+    // Keep the task dropdown in sync with the web app so tasks created there show
+    // up here within seconds instead of only after a full restart.
+    startTaskListSync();
 
     // Start mirroring HRM-initiated timers (web → desktop). Always-on, so a timer
     // started from the web app is followed even when the desktop is sitting idle.
