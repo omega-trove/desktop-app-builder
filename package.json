@@ -23,6 +23,7 @@
       "!**/window-tracker.cs"
     ],
     "win": {
+      "publisherName": "Omega Trove LLC",
       "target": [
         "nsis"
       ],
