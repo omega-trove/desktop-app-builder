@@ -385,7 +385,9 @@ async function pollTimerCommand() {
                 selectGeneralWorkInDropdown();
                 // New local session (source=desktop) → timer-command returns
                 // 'none' next tick, so this does not loop back on itself.
-                await startTracking();
+                // keepSeconds: hand the daily counter over untouched so it flows
+                // continuously instead of snapping back by the poll-gap seconds.
+                await startTracking({ keepSeconds: true });
                 syncLog('stop: now tracking General Work locally (external=', externalTimeLogId, ')');
             } else {
                 syncLog('stop: not mirroring anything → no-op');
@@ -607,6 +609,11 @@ function startStreamPolling() {
 async function startTracking(options = {}) {
     if (isTracking) return;
     const attachTimeLogId = options.attachTimeLogId ?? null;
+    // options.keepSeconds : when true, DON'T snap the big daily counter back to the
+    //   server's completed-only total on session start. Used by the seamless
+    //   "web task Stop → continue as General Work" hand-off, where the server total
+    //   lags by the ~5s poll gap and snapping to it makes the timer jump backwards.
+    const keepSeconds = options.keepSeconds === true;
     isTracking = true;
     if (window.electronAPI && window.electronAPI.setTrackingActive) {
         window.electronAPI.setTrackingActive(true);   // close (X) now hides & keeps tracking
@@ -690,7 +697,11 @@ async function startTracking(options = {}) {
                 if(!response.ok) throw new Error(data.message || 'Failed to start session');
 
                 timeLogId = data.time_log_id;
-                seconds = data.today_total_seconds || seconds;
+                // Keep the daily counter flowing on a seamless auto-continue; only a
+                // fresh manual start reconciles to the authoritative today total.
+                if (!keepSeconds) {
+                    seconds = data.today_total_seconds || seconds;
+                }
                 document.getElementById('statusText').innerText = __('tracking_active');
 
             } catch(netErr) {
