@@ -27,11 +27,26 @@ jobs:
           cache: 'npm'
           cache-dependency-path: './package-lock.json'
 
+      - name: Setup .NET (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install Microsoft Sign CLI (Windows)
+        if: matrix.os == 'windows-latest'
+        run: dotnet tool install --global Microsoft.Trusted.Signing.Client || true
+        shell: bash
+
       - name: Install Dependencies
         run: |
           npm ci
 
       - name: Build and Package App
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         run: |
           if [ "$RUNNER_OS" == "Windows" ]; then
             npx electron-builder --win --publish never
