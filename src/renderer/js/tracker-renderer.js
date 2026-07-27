@@ -320,6 +320,20 @@ function resetTaskSelectionUI() {
     if (titleInput) { titleInput.value = ''; titleInput.disabled = false; }
 }
 
+// Point the task picker at "General Work" (no specific task) so the follow-up
+// startTracking() opens a desktop-owned General Work session. Falls back to the
+// blank "-- Choose Task --" value if the General Work option isn't present; both
+// resolve to a null task_id in startTracking().
+function selectGeneralWorkInDropdown() {
+    const select = document.getElementById('taskSelect');
+    const titleInput = document.getElementById('taskTitle');
+    if (select) {
+        const hasGeneral = Array.from(select.options).some(o => o.value === 'general_work');
+        select.value = hasGeneral ? 'general_work' : '';
+    }
+    if (titleInput) { titleInput.value = ''; titleInput.disabled = false; }
+}
+
 // One tick of the HRM → Desktop sync. The server's timer-command endpoint is the
 // single source of truth; we simply reconcile our local state to it.
 async function pollTimerCommand() {
@@ -355,12 +369,24 @@ async function pollTimerCommand() {
             syncLog('start: attached ✓ external=', externalTimeLogId);
 
         } else if (cmd.action === 'stop') {
-            // Only react while mirroring an HRM session. A manual desktop session
-            // reports as 'none', never 'stop', so this can never kill a local one.
+            // A web/slack TASK timer was stopped (or ended) server-side. We only
+            // react while we were MIRRORING it (externalTimeLogId set) — a manual
+            // desktop session reports as 'none', never 'stop', so a local session
+            // is never touched here.
+            //
+            // Product decision: stopping a task on the web must NOT halt the
+            // desktop timer. So we detach from the (already-closed) task session
+            // WITHOUT re-stopping it on the server, then seamlessly CONTINUE on a
+            // fresh, desktop-owned General Work session. The big timer keeps
+            // counting; only the task association is dropped.
             if (externalTimeLogId !== null) {
-                syncLog('stop: HRM ended session', externalTimeLogId, '→ detaching (stop-skip) + reverting UI');
+                syncLog('stop: web ended task session', externalTimeLogId, '→ detaching + continuing as General Work');
                 await stopTracking({ skipServerStop: true });
-                resetTaskSelectionUI();
+                selectGeneralWorkInDropdown();
+                // New local session (source=desktop) → timer-command returns
+                // 'none' next tick, so this does not loop back on itself.
+                await startTracking();
+                syncLog('stop: now tracking General Work locally (external=', externalTimeLogId, ')');
             } else {
                 syncLog('stop: not mirroring anything → no-op');
             }
