@@ -9,6 +9,20 @@ let trackingInterval = null;
 let rulesRefreshInterval = null;
 let offlineSessionStartTime = null;
 
+// ── HRM → Desktop timer sync ────────────────────────────────────────────────
+// externalTimeLogId is the HRM-created time_log_id we are currently *mirroring*
+// (a timer started from the web app). It is null whenever we are idle or running
+// a manual desktop session that we own ourselves. We only ever auto-stop / switch
+// a session when this is non-null, so a manual session is never disturbed.
+let externalTimeLogId = null;
+let timerCommandInterval = null;  // always-on 5s poll of /tracking/timer-command
+let timerSyncBusy = false;        // reentrancy guard so overlapping polls can't race
+
+// Flip to true (or set localStorage 'timer_sync_debug' = '1' and reload) to log
+// every sync decision to the DevTools console during live testing.
+const TIMER_SYNC_DEBUG = (typeof localStorage !== 'undefined' && localStorage.getItem('timer_sync_debug') === '1');
+function syncLog(...args) { if (TIMER_SYNC_DEBUG) console.log('%c[timer-sync]', 'color:#4f46e5;font-weight:bold', ...args); }
+
 // Live Streaming Engine Params
 let streamActive = false;
 let streamInterval = null;
@@ -94,6 +108,8 @@ document.getElementById('logoutBtn').addEventListener('click', () => {
     try { dismissDistractionWarning(); } catch (e) {}
     if (distractionGuardInterval) { clearInterval(distractionGuardInterval); distractionGuardInterval = null; }
     if (rulesRefreshInterval) { clearInterval(rulesRefreshInterval); rulesRefreshInterval = null; }
+    if (timerCommandInterval) { clearInterval(timerCommandInterval); timerCommandInterval = null; }
+    externalTimeLogId = null;
     localStorage.removeItem('user_name');
     window.electronAPI.clearToken();
     window.electronAPI.navigateTo('login');
@@ -225,6 +241,112 @@ document.getElementById('taskSelect').addEventListener('change', (e) => {
     }
 });
 
+// ── HRM → Desktop timer sync helpers ────────────────────────────────────────
+
+// Select a task in the dropdown by id, refreshing the list once if it isn't
+// there yet, and injecting a temporary option as a last resort so the UI always
+// reflects what HRM is tracking. taskId === null means "no specific task".
+async function selectTaskInDropdown(taskId, taskTitle) {
+    const select = document.getElementById('taskSelect');
+    const titleInput = document.getElementById('taskTitle');
+    if (!select) return;
+
+    const pick = () => {
+        const opt = Array.from(select.options).find(o => o.value === String(taskId));
+        if (opt) { select.value = opt.value; return true; }
+        return false;
+    };
+
+    if (taskId === null || taskId === undefined) {
+        select.value = '';
+    } else if (!pick()) {
+        try { await loadTasks(); } catch (e) { /* offline — fall through */ }
+        if (!pick()) {
+            const tmp = document.createElement('option');
+            tmp.value = String(taskId);
+            tmp.text = (taskTitle || 'Task') + ' [HRM]';
+            select.add(tmp);
+            select.value = String(taskId);
+        }
+    }
+
+    if (titleInput) {
+        titleInput.value = taskTitle || '';
+        titleInput.disabled = true;
+    }
+}
+
+// Revert the task picker to the "-- Choose Task --" state after an HRM stop.
+function resetTaskSelectionUI() {
+    const select = document.getElementById('taskSelect');
+    const titleInput = document.getElementById('taskTitle');
+    if (select) select.value = '';
+    if (titleInput) { titleInput.value = ''; titleInput.disabled = false; }
+}
+
+// One tick of the HRM → Desktop sync. The server's timer-command endpoint is the
+// single source of truth; we simply reconcile our local state to it.
+async function pollTimerCommand() {
+    if (!token || timerSyncBusy) return;
+    timerSyncBusy = true;
+    try {
+        const res = await fetchWithAuth(`${API_BASE}/tracking/timer-command`, { timeoutMs: 8000 });
+        if (!res.ok) { syncLog('poll skipped — HTTP', res.status); return; }
+        const cmd = await res.json();
+        syncLog('poll →', cmd, `| local: isTracking=${isTracking} external=${externalTimeLogId}`);
+
+        if (cmd.action === 'start') {
+            // Idempotent: already mirroring this exact HRM session → do nothing.
+            if (externalTimeLogId === cmd.time_log_id) {
+                syncLog('start: already mirroring', cmd.time_log_id, '→ no-op (idempotent)');
+                return;
+            }
+
+            // A new HRM session, or a task switch to a different time_log_id. If we
+            // are currently tracking anything, tear it down WITHOUT re-stopping it
+            // on the server (the web start already closed the previous log), then
+            // attach to the new one. This is the graceful task-switch transition.
+            if (isTracking) {
+                syncLog(externalTimeLogId !== null
+                    ? `start: switching mirror ${externalTimeLogId} → ${cmd.time_log_id} (stop-skip + reattach)`
+                    : `start: HRM overrode a manual session → detaching (stop-skip) then attaching ${cmd.time_log_id}`);
+                await stopTracking({ skipServerStop: true });
+            } else {
+                syncLog('start: attaching to HRM session', cmd.time_log_id, `(task "${cmd.task_title}")`);
+            }
+            await selectTaskInDropdown(cmd.task_id, cmd.task_title);
+            await startTracking({ attachTimeLogId: cmd.time_log_id });
+            syncLog('start: attached ✓ external=', externalTimeLogId);
+
+        } else if (cmd.action === 'stop') {
+            // Only react while mirroring an HRM session. A manual desktop session
+            // reports as 'none', never 'stop', so this can never kill a local one.
+            if (externalTimeLogId !== null) {
+                syncLog('stop: HRM ended session', externalTimeLogId, '→ detaching (stop-skip) + reverting UI');
+                await stopTracking({ skipServerStop: true });
+                resetTaskSelectionUI();
+            } else {
+                syncLog('stop: not mirroring anything → no-op');
+            }
+        } else {
+            // action === 'none' (manual desktop session / legacy null row): do nothing.
+            syncLog('none: manual/legacy session → no-op (staying out of the way)');
+        }
+    } catch (e) {
+        // Transient network error — the next tick self-heals. Never throw here.
+        syncLog('poll error (will retry next tick):', e && e.message);
+    } finally {
+        timerSyncBusy = false;
+    }
+}
+
+// Always-on 5s poll so an HRM-started timer is picked up even while idle.
+function startTimerCommandSync() {
+    if (timerCommandInterval) clearInterval(timerCommandInterval);
+    timerCommandInterval = setInterval(pollTimerCommand, 5000);
+    pollTimerCommand(); // fire immediately on boot
+}
+
 async function boot() {
     token = await window.electronAPI.getToken();
     if (!token) {
@@ -258,6 +380,10 @@ async function boot() {
     if (rulesRefreshInterval) clearInterval(rulesRefreshInterval);
     rulesRefreshInterval = setInterval(loadDistractingApps, 30000);
     startDistractionGuard();
+
+    // Start mirroring HRM-initiated timers (web → desktop). Always-on, so a timer
+    // started from the web app is followed even when the desktop is sitting idle.
+    startTimerCommandSync();
 }
 boot();
 
@@ -335,8 +461,12 @@ function startStreamPolling() {
     shouldStreamCheckInterval = setInterval(checkStreamStatus, currentPollRate);
 }
 
-async function startTracking() {
+// options.attachTimeLogId : when set, ATTACH to an HRM-created session instead of
+//   creating a new one — we adopt that time_log_id and never call session/start
+//   (doing so would spawn a duplicate log and break the sync loop).
+async function startTracking(options = {}) {
     if (isTracking) return;
+    const attachTimeLogId = options.attachTimeLogId ?? null;
     isTracking = true;
     if (window.electronAPI && window.electronAPI.setTrackingActive) {
         window.electronAPI.setTrackingActive(true);   // close (X) now hides & keeps tracking
@@ -383,37 +513,51 @@ async function startTracking() {
         if (uiInterval) clearInterval(uiInterval);
         uiInterval = setInterval(incrementAndDisplay, 1000);
 
-        // Network session start (best-effort; reconciles state when it returns).
-        try {
-            const response = await fetchWithAuth(`${API_BASE}/tracking/session/start`, {
-                method: 'POST',
-                body: JSON.stringify({ project_id: null, task_id: taskId, task_title: taskTitle })
-            });
-            const data = await response.json();
-            if(!response.ok) throw new Error(data.message || 'Failed to start session');
-
-            timeLogId = data.time_log_id;
-            seconds = data.today_total_seconds || seconds;
+        if (attachTimeLogId !== null) {
+            // ATTACH MODE (HRM → Desktop sync): the server already created this
+            // session when the user pressed Start in the web app. We adopt its
+            // time_log_id for all screenshot/activity uploads and DO NOT call
+            // session/start — a second session would duplicate the log and flip
+            // the sync endpoint to `none`, orphaning the HRM timer.
+            timeLogId = attachTimeLogId;
+            externalTimeLogId = attachTimeLogId;
             document.getElementById('statusText').innerText = __('tracking_active');
+        } else {
+            // MANUAL/LOCAL SESSION — we own it. Clear any external-mirror marker.
+            externalTimeLogId = null;
 
-        } catch(netErr) {
-            console.warn("Offline! creating shadow local session", netErr);
-            // Secure client UUID bound to precise timestamp and random noise
-            timeLogId = 'local_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
-            offlineSessionStartTime = new Date().toISOString();
-            document.getElementById('statusText').innerText = __('offline_tracking_active');
-
-            // Insert unclosed session record locally
-            if(offlineDb) {
-                const tx = offlineDb.transaction('offline_sessions', 'readwrite');
-                tx.objectStore('offline_sessions').put({
-                    client_id: timeLogId,
-                    task_id: taskId,
-                    task_title: taskTitle,
-                    started_at: offlineSessionStartTime,
-                    ended_at: null,
-                    total_seconds: 0
+            // Network session start (best-effort; reconciles state when it returns).
+            try {
+                const response = await fetchWithAuth(`${API_BASE}/tracking/session/start`, {
+                    method: 'POST',
+                    body: JSON.stringify({ project_id: null, task_id: taskId, task_title: taskTitle })
                 });
+                const data = await response.json();
+                if(!response.ok) throw new Error(data.message || 'Failed to start session');
+
+                timeLogId = data.time_log_id;
+                seconds = data.today_total_seconds || seconds;
+                document.getElementById('statusText').innerText = __('tracking_active');
+
+            } catch(netErr) {
+                console.warn("Offline! creating shadow local session", netErr);
+                // Secure client UUID bound to precise timestamp and random noise
+                timeLogId = 'local_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10);
+                offlineSessionStartTime = new Date().toISOString();
+                document.getElementById('statusText').innerText = __('offline_tracking_active');
+
+                // Insert unclosed session record locally
+                if(offlineDb) {
+                    const tx = offlineDb.transaction('offline_sessions', 'readwrite');
+                    tx.objectStore('offline_sessions').put({
+                        client_id: timeLogId,
+                        task_id: taskId,
+                        task_title: taskTitle,
+                        started_at: offlineSessionStartTime,
+                        ended_at: null,
+                        total_seconds: 0
+                    });
+                }
             }
         }
 
@@ -476,6 +620,7 @@ async function startTracking() {
         // tear them back down instead of leaving a zombie (timer ticking while
         // isTracking is false). Reset fully to the idle state before alerting.
         isTracking = false;
+        externalTimeLogId = null; // never leave a mirror marker set on a failed start
         if (uiInterval) { clearInterval(uiInterval); uiInterval = null; }
         if (trackBtn) {
             trackBtn.classList.remove('active');
@@ -497,7 +642,11 @@ async function startTracking() {
     }
 }
 
-async function stopTracking() {
+// options.skipServerStop : when true, tear the local session down WITHOUT calling
+//   session/{id}/stop. Used when HRM has already closed the session server-side
+//   (a web Stop, or a task switch where the web start already closed the old log).
+async function stopTracking(options = {}) {
+    const skipServerStop = options.skipServerStop === true;
     // Reset local tracking states synchronously and instantly to prevent leaks/freezes
     isTracking = false;
     if (window.electronAPI && window.electronAPI.setTrackingActive) {
@@ -569,13 +718,23 @@ async function stopTracking() {
         if (taskTitle) taskTitle.disabled = false;
     }
 
+    // We are no longer mirroring any HRM session once tracking stops.
+    externalTimeLogId = null;
+
     if(!timeLogId) return;
-    
+
     // Capture session IDs to process asynchronously
     const targetLogId = timeLogId;
     const targetSeconds = currentSessionSeconds;
-    
+
     timeLogId = null;
+
+    // HRM-commanded stop: the server already closed this session. Calling the stop
+    // endpoint again would be redundant/erroneous, so just drop the local session.
+    if (skipServerStop) {
+        startTrackerReminder();
+        return;
+    }
 
     // Inform server about the stop in the background asynchronously
     try {
