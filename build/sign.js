@@ -93,7 +93,7 @@ exports.default = async function(configuration) {
                 try {
                     const files = fs.readdirSync(dotnetToolsDir);
                     console.log(`Found .dotnet/tools in ${profile}:`, files);
-                    const match = files.find(f => f.toLowerCase() === 'sign.exe' || f.toLowerCase() === 'dotnet-sign.exe' || f.toLowerCase().endsWith('.exe'));
+                    const match = files.find(f => f.toLowerCase() === 'sign.exe' || f.toLowerCase() === 'sign' || f.toLowerCase() === 'sign.cmd');
                     if (match) {
                         foundExe = path.join(dotnetToolsDir, match);
                         break;
