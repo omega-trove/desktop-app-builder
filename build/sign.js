@@ -64,6 +64,7 @@ exports.default = async function(configuration) {
     // Determine executable and args for signing
     let signExecutable = dotnetPath;
     let args = [];
+    let useShell = false;
 
     if (signDllPath) {
         // Run via dotnet host + sign.dll (local SDK / extracted tool)
@@ -78,17 +79,36 @@ exports.default = async function(configuration) {
             filePath
         ];
     } else {
-        // Check if Microsoft Sign CLI (sign.exe) was installed globally (e.g. in CI)
-        const userProfile = process.env.USERPROFILE || process.env.HOME || '';
-        const globalSignExe = path.join(userProfile, '.dotnet', 'tools', 'sign.exe');
-        const globalSign = path.join(userProfile, '.dotnet', 'tools', 'sign');
+        // Check if Microsoft Sign CLI was installed globally (e.g. in CI)
+        const possibleProfiles = [
+            process.env.USERPROFILE,
+            process.env.HOME,
+            'C:\\Users\\runneradmin'
+        ].filter(Boolean);
 
-        if (fs.existsSync(globalSignExe)) {
-            signExecutable = globalSignExe;
-        } else if (fs.existsSync(globalSign)) {
-            signExecutable = globalSign;
+        let foundExe = null;
+        for (const profile of possibleProfiles) {
+            const dotnetToolsDir = path.join(profile, '.dotnet', 'tools');
+            if (fs.existsSync(dotnetToolsDir)) {
+                try {
+                    const files = fs.readdirSync(dotnetToolsDir);
+                    console.log(`Found .dotnet/tools in ${profile}:`, files);
+                    const match = files.find(f => f.toLowerCase() === 'sign.exe' || f.toLowerCase() === 'dotnet-sign.exe' || f.toLowerCase().endsWith('.exe'));
+                    if (match) {
+                        foundExe = path.join(dotnetToolsDir, match);
+                        break;
+                    }
+                } catch (e) {
+                    console.warn(`Could not read ${dotnetToolsDir}:`, e.message);
+                }
+            }
+        }
+
+        if (foundExe) {
+            signExecutable = foundExe;
         } else {
             signExecutable = 'sign';
+            useShell = true; // Use shell so PATH resolution works on Windows
         }
 
         args = [
@@ -109,7 +129,7 @@ exports.default = async function(configuration) {
     };
 
     console.log(`Running Sign CLI (${signExecutable}) for: ${path.basename(filePath)}...`);
-    const result = spawnSync(signExecutable, args, { env, stdio: 'inherit' });
+    const result = spawnSync(signExecutable, args, { env, stdio: 'inherit', shell: useShell });
 
     if (result.status !== 0) {
         console.error(`❌ Signing failed for: ${filePath}`);
