@@ -347,6 +347,76 @@ function startTimerCommandSync() {
     pollTimerCommand(); // fire immediately on boot
 }
 
+// ── macOS permission pre-flight (renderer side) ─────────────────────────────
+// No-op on Windows/Linux. On macOS: shows a one-time native guided dialog when
+// Screen Recording / Accessibility are missing, plus a persistent banner with
+// deep-link buttons so the user can fix it and re-check without restarting.
+let macPermsPrompted = false;
+
+function removePermissionBanner() {
+    const el = document.getElementById('macPermBanner');
+    if (el) el.remove();
+}
+
+function renderPermissionBanner(status) {
+    const ar = (typeof currentLocale !== 'undefined' && currentLocale === 'ar');
+    removePermissionBanner();
+
+    const bar = document.createElement('div');
+    bar.id = 'macPermBanner';
+    bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#b91c1c;color:#fff;'
+        + 'padding:10px 14px;font-size:13px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;'
+        + 'box-shadow:0 2px 8px rgba(0,0,0,.3);' + (ar ? 'direction:rtl;' : '');
+
+    const msg = document.createElement('span');
+    msg.style.cssText = 'flex:1;min-width:200px;';
+    msg.textContent = ar
+        ? '⚠️ أذونات macOS مطلوبة — بعض ميزات التتبع معطّلة حتى تفعيلها.'
+        : '⚠️ macOS permissions needed — some tracking features are disabled until granted.';
+    bar.appendChild(msg);
+
+    const mkBtn = (label, onClick) => {
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.style.cssText = 'background:#fff;color:#b91c1c;border:none;border-radius:6px;padding:6px 10px;'
+            + 'font-size:12px;font-weight:600;cursor:pointer;';
+        b.addEventListener('click', onClick);
+        return b;
+    };
+
+    if (status.screen !== 'granted') {
+        bar.appendChild(mkBtn(ar ? 'تسجيل الشاشة' : 'Screen Recording',
+            () => window.electronAPI.openPrivacyPane('screen')));
+    }
+    if (!status.accessibility) {
+        bar.appendChild(mkBtn(ar ? 'الإتاحة' : 'Accessibility',
+            () => window.electronAPI.openPrivacyPane('accessibility')));
+    }
+    bar.appendChild(mkBtn(ar ? 'إعادة الفحص' : 'Re-check', () => initMacPermissions()));
+
+    document.body.appendChild(bar);
+}
+
+async function initMacPermissions() {
+    if (!window.electronAPI || !window.electronAPI.checkMacPermissions) return;
+    let status;
+    try { status = await window.electronAPI.checkMacPermissions(); } catch (e) { return; }
+    if (!status || !status.isMac) return; // Windows/Linux: nothing to do
+
+    if (status.ok) { removePermissionBanner(); return; }
+
+    // Native guided dialog once per launch; the banner persists for follow-up.
+    if (!macPermsPrompted) {
+        macPermsPrompted = true;
+        try { await window.electronAPI.guideMacPermissions(); } catch (e) {}
+    }
+    renderPermissionBanner(status);
+}
+
+// Re-check when the user returns to the app (e.g. after toggling a permission in
+// System Settings), so the banner clears itself without a restart.
+window.addEventListener('focus', () => { initMacPermissions(); });
+
 async function boot() {
     token = await window.electronAPI.getToken();
     if (!token) {
@@ -384,6 +454,10 @@ async function boot() {
     // Start mirroring HRM-initiated timers (web → desktop). Always-on, so a timer
     // started from the web app is followed even when the desktop is sitting idle.
     startTimerCommandSync();
+
+    // macOS: verify Screen Recording / Accessibility are granted and guide the
+    // user if not. No-op on Windows/Linux.
+    initMacPermissions();
 }
 boot();
 
@@ -522,6 +596,20 @@ async function startTracking(options = {}) {
             timeLogId = attachTimeLogId;
             externalTimeLogId = attachTimeLogId;
             document.getElementById('statusText').innerText = __('tracking_active');
+
+            // Attach skips session/start (where `seconds` is normally reconciled),
+            // so pull today's total explicitly to keep the daily counter accurate
+            // in the UI while mirroring. Best-effort — the live uiInterval keeps
+            // ticking regardless if this fails.
+            try {
+                const statsRes = await fetchWithAuth(`${API_BASE}/tracking/today-stats`, { timeoutMs: 8000 });
+                const stats = await statsRes.json();
+                if (typeof stats.today_total_seconds === 'number') {
+                    seconds = stats.today_total_seconds;
+                }
+            } catch (e) {
+                console.warn('today-stats refresh on attach failed (keeping current value):', e && e.message);
+            }
         } else {
             // MANUAL/LOCAL SESSION — we own it. Clear any external-mirror marker.
             externalTimeLogId = null;

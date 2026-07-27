@@ -27,6 +27,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     closeActiveWindow: () => ipcRenderer.invoke('close-active-window'),
     simulateMouseClick: (x, y) => ipcRenderer.invoke('simulate-mouse-click', { x, y }),
 
+    // macOS permission pre-flight (no-ops on Windows/Linux)
+    checkMacPermissions: () => ipcRenderer.invoke('check-mac-permissions'),
+    guideMacPermissions: () => ipcRenderer.invoke('guide-mac-permissions'),
+    openPrivacyPane: (pane) => ipcRenderer.invoke('open-privacy-pane', pane),
+
     // Optional: Listen for events from main if needed in future
     onUpdateAvailable: (callback) => {
         ipcRenderer.on('update-available', callback);

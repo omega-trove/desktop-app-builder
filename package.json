@@ -6,8 +6,9 @@
   "main": "src/main/main.js",
   "scripts": {
     "start": "electron .",
-    "clean": "if exist dist rmdir /s /q dist",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "npm run clean && electron-builder --win",
+    "build:mac": "npm run clean && electron-builder --mac",
     "build:all": "npm run clean && electron-builder --win --mac --linux"
   },
   "build": {
@@ -17,6 +18,10 @@
     "directories": {
       "output": "dist"
     },
+    "files": [
+      "**/*",
+      "!**/window-tracker.cs"
+    ],
     "win": {
       "target": [
         "nsis"
@@ -30,6 +35,40 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "installerIcon": "assets/icon.ico"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.productivity",
+      "icon": "assets/icon.png",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "extendInfo": {
+        "NSAppleEventsUsageDescription": "Omega Tracker reads the active window and browser tab title to record your work activity.",
+        "NSLocationWhenInUseUsageDescription": "Omega Tracker records your work location for attendance tracking.",
+        "NSSystemAdministrationUsageDescription": "Omega Tracker enforces focus rules by managing distracting app windows."
+      },
+      "files": [
+        "!**/window-tracker.exe",
+        "!**/window-tracker.cs"
+      ]
+    },
+    "dmg": {
+      "sign": false
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Utility",
+      "files": [
+        "!**/window-tracker.exe",
+        "!**/window-tracker.cs"
+      ]
     }
   },
   "author": "Omega Track",

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, powerMonitor, desktopCapturer, Tray, Menu, dialog, nativeImage, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, powerMonitor, desktopCapturer, Tray, Menu, dialog, nativeImage, safeStorage, systemPreferences, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { exec: _rawExec } = require('child_process');
@@ -384,6 +384,106 @@ ipcMain.handle('request-attention', () => {
         mainWindow.focus();
         mainWindow.flashFrame(true);
     }
+});
+
+// ── macOS permission pre-flight ─────────────────────────────────────────────
+// macOS gates screenshots behind "Screen Recording" and active-window title /
+// focus-rule enforcement behind "Accessibility" (TCC). Both must be granted
+// manually in System Settings, and until they are the features silently
+// under-function (black screenshots, "Unknown Window"). We detect what's
+// missing and deep-link the user straight to the correct Privacy pane.
+function getMacPermissionStatus() {
+    if (process.platform !== 'darwin') {
+        // Windows/Linux need no TCC grants for what we do.
+        return { isMac: false, screen: 'granted', accessibility: true, ok: true };
+    }
+    // 'granted' | 'denied' | 'restricted' | 'not-determined'
+    let screen = 'granted';
+    let accessibility = true;
+    try { screen = systemPreferences.getMediaAccessStatus('screen'); } catch (e) {}
+    try { accessibility = systemPreferences.isTrustedAccessibilityClient(false); } catch (e) {}
+    return {
+        isMac: true,
+        screen,
+        accessibility,
+        ok: screen === 'granted' && accessibility === true,
+    };
+}
+
+function openPrivacyPane(pane) {
+    const urls = {
+        screen: 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
+        accessibility: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
+    };
+    const url = urls[pane];
+    if (url) { shell.openExternal(url).catch(() => {}); }
+}
+
+// Non-interactive status check (used by the renderer to show/refresh a banner).
+ipcMain.handle('check-mac-permissions', () => getMacPermissionStatus());
+
+// Open a specific Privacy pane on demand (banner buttons).
+ipcMain.handle('open-privacy-pane', (event, pane) => { openPrivacyPane(pane); return true; });
+
+// Interactive guide: shown once on the tracker screen when something is missing.
+// Triggers the native Accessibility prompt (so the app appears in the list) and
+// deep-links the user to the pane(s) they still need to enable.
+ipcMain.handle('guide-mac-permissions', async () => {
+    const status = getMacPermissionStatus();
+    if (!status.isMac || status.ok) return status;
+
+    // Registers the app in the Accessibility list and shows the native prompt,
+    // so the toggle is actually present when the user opens the pane.
+    if (!status.accessibility) {
+        try { systemPreferences.isTrustedAccessibilityClient(true); } catch (e) {}
+    }
+
+    const isAr = appLocale === 'ar';
+    const missing = [];
+    if (status.screen !== 'granted') {
+        missing.push(isAr ? '• تسجيل الشاشة (مطلوب لالتقاط لقطات الشاشة)' : '• Screen Recording (required for screenshots)');
+    }
+    if (!status.accessibility) {
+        missing.push(isAr ? '• الإتاحة Accessibility (مطلوب لتتبّع النافذة النشطة وقواعد التركيز)' : '• Accessibility (required for active-window tracking & focus rules)');
+    }
+
+    const detail = (isAr
+        ? 'يحتاج Omega Tracker إلى الأذونات التالية للعمل بشكل صحيح على نظام macOS:\n\n'
+        : 'Omega Tracker needs the following macOS permission(s) to work correctly:\n\n')
+        + missing.join('\n')
+        + (isAr
+            ? '\n\nافتح الإعدادات، فعّل Omega Tracker في القائمة، ثم أعد تشغيل التطبيق.'
+            : '\n\nOpen Settings, enable Omega Tracker in the list, then restart the app.');
+
+    const buttons = [];
+    const actions = [];
+    if (status.screen !== 'granted') { buttons.push(isAr ? 'فتح تسجيل الشاشة' : 'Open Screen Recording'); actions.push('screen'); }
+    if (!status.accessibility) { buttons.push(isAr ? 'فتح الإتاحة' : 'Open Accessibility'); actions.push('accessibility'); }
+    buttons.push(isAr ? 'لاحقاً' : 'Later'); actions.push('later');
+
+    const dialogOpts = {
+        type: 'warning',
+        title: 'Omega Tracker',
+        message: isAr ? 'أذونات نظام macOS مطلوبة' : 'macOS permissions required',
+        detail,
+        buttons,
+        defaultId: 0,
+        cancelId: buttons.length - 1,
+        noLink: true,
+    };
+    const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+
+    let response = buttons.length - 1;
+    try {
+        const res = parent
+            ? await dialog.showMessageBox(parent, dialogOpts)
+            : await dialog.showMessageBox(dialogOpts);
+        response = res.response;
+    } catch (e) { /* dialog failed — return status anyway */ }
+
+    const action = actions[response];
+    if (action === 'screen' || action === 'accessibility') { openPrivacyPane(action); }
+    return status;
 });
 
 // Get system idle time
