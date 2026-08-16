@@ -922,7 +922,13 @@ async function stopTracking(options = {}) {
                     if(sessionReq.result) {
                         let sess = sessionReq.result;
                         sess.ended_at = new Date().toISOString();
-                        sess.total_seconds = Math.floor((new Date() - new Date(sess.started_at)) / 1000);
+                        // Record the ACTUAL accumulated active seconds (currentSessionSeconds,
+                        // captured above as targetSeconds) rather than the raw wall-clock span
+                        // (now - started_at). The tick counter only advances while tracking is
+                        // live, so pauses/idle are already excluded. Using wall-clock here was
+                        // the cause of an offline session that was paused (e.g. 2h of work over
+                        // a 5h span) syncing back as the full 5h once the server returned.
+                        sess.total_seconds = targetSeconds;
                         store.put(sess);
                     }
                 };

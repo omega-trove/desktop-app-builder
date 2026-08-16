@@ -30,7 +30,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     loginBtn.addEventListener('click', async () => {
         const email = document.getElementById('email').value.trim();
-        const password = document.getElementById('password').value.trim();
+        // Do NOT trim the password. The server (and the web login form) compares the
+        // password exactly as stored, so trimming here made a credential with leading
+        // or trailing whitespace succeed on the web portal but fail on the desktop
+        // with "Invalid credentials" for the *same* password the admin set.
+        const password = document.getElementById('password').value;
 
         if (!email || !password) {
             errorMsg.innerText = __('email_password_required');
@@ -53,7 +57,14 @@ document.addEventListener('DOMContentLoaded', async () => {
                 },
                 body: JSON.stringify({
                     email,
-                    password
+                    password,
+                    // Tag this as a desktop login so the backend issues a
+                    // 'desktop-auth-token' (its own device bucket). Without it the
+                    // desktop shared the generic 'auth-token' bucket, so any other
+                    // generic login for the same user silently revoked the desktop
+                    // session — surfacing later as an unexpected auth failure.
+                    device_type: 'desktop',
+                    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
                 })
             });
 
