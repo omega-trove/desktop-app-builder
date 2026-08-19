@@ -3,6 +3,39 @@ let isTracking = false;
 let timeLogId = null;
 let seconds = 0;
 let currentSessionSeconds = 0;
+
+// Wall-clock anchor for the counter. `seconds` used to be a count of how many
+// times a 1s interval had fired, which is not the same thing as elapsed time:
+// every tick carries scheduling latency, and under load or while the machine is
+// asleep ticks are dropped entirely. The error only ever accumulates in one
+// direction, and because the server clamps a reported duration to
+// min(clientSeconds, wallClock) the short client value always won — so the drift
+// came out of the employee's paid time. The counter is now derived from
+// Date.now() deltas, with the sub-second remainder carried between ticks.
+let lastTickMs = null;
+let tickRemainderMs = 0;
+// A delta larger than this means the machine slept, hibernated or froze rather
+// than that the user worked through it. Discarding it preserves the behaviour of
+// the old tick counter (no ticks fired while suspended) without pretending the
+// time was worked. Genuine sleep/wake handling is tracked separately.
+const MAX_TICK_DELTA_MS = 90000;
+
+// The calendar day the daily counter currently represents. The counter was only
+// ever re-baselined at launch or on a manual start, so an app left running over
+// midnight kept yesterday's total on the clock indefinitely — the server-side
+// day-window fix corrected which sessions belong to today, but nothing told a
+// long-running client that the day had turned.
+//
+// Detection uses the CLIENT's local date, while the authoritative daily total is
+// whatever the server returns for its own company-timezone day. Those can
+// disagree by the UTC offset, so the transition is a trigger to re-fetch, never
+// a source of truth: the value always comes from /tracking/today-stats.
+let counterDayKey = null;
+
+function localDayKey(date) {
+    const d = date || new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
 let dailyTargetHours = 8.0;
 let uiInterval = null;
 let trackingInterval = null;
@@ -193,8 +226,12 @@ async function initDailyTime() {
             localStorage.setItem('tracker_anticheat_interval', data.tracker_anticheat_interval);
         }
         
-        if (data.today_total_seconds) {
+        // Must be a type check, not a truthiness check: on the first launch of a
+        // new day the server legitimately reports 0, and `if (0)` would skip the
+        // assignment and leave yesterday's total on the clock.
+        if (typeof data.today_total_seconds === 'number') {
             seconds = data.today_total_seconds;
+            counterDayKey = localDayKey();
         }
         updateTimerUI();
     } catch(e) {
@@ -544,7 +581,7 @@ async function checkStreamStatus() {
                 if (toggle.checked) {
                     toggle.checked = false;
                     console.warn("Meeting mode limit reached for today. Disabling meeting mode.");
-                    alert("Meeting mode limit reached for today! Mode disabled.");
+                    showToast("Meeting mode limit reached for today! Mode disabled.", { variant: 'warn' });
                 }
                 toggle.disabled = true;
             }
@@ -628,7 +665,7 @@ async function startTracking(options = {}) {
     if (trackBtn) trackBtn.disabled = true;
     
     // Clear any existing leftover intervals to avoid duplicates
-    if (uiInterval) clearInterval(uiInterval);
+    stopCounterTicking();
     if (trackingInterval) clearInterval(trackingInterval);
     if (shouldStreamCheckInterval) clearInterval(shouldStreamCheckInterval);
     if (streamInterval) clearInterval(streamInterval);
@@ -657,8 +694,7 @@ async function startTracking(options = {}) {
             trackBtn.disabled = false;
         }
         document.getElementById('statusText').innerText = __('tracking_active');
-        if (uiInterval) clearInterval(uiInterval);
-        uiInterval = setInterval(incrementAndDisplay, 1000);
+        startCounterTicking();
 
         if (attachTimeLogId !== null) {
             // ATTACH MODE (HRM → Desktop sync): the server already created this
@@ -700,7 +736,11 @@ async function startTracking(options = {}) {
                 // Keep the daily counter flowing on a seamless auto-continue; only a
                 // fresh manual start reconciles to the authoritative today total.
                 if (!keepSeconds) {
-                    seconds = data.today_total_seconds || seconds;
+                    // `|| seconds` would reject a legitimate 0 at the start of a
+                    // new day and keep the previous day's total (see loadInitialTime).
+                    seconds = typeof data.today_total_seconds === 'number'
+                        ? data.today_total_seconds
+                        : seconds;
                 }
                 document.getElementById('statusText').innerText = __('tracking_active');
 
@@ -729,6 +769,9 @@ async function startTracking(options = {}) {
         
         // Background interval (Runs every 1 minute)
         trackingInterval = setInterval(async () => {
+            // Midnight may have passed since the last tick.
+            await checkDayRollover();
+
             const inMeeting = document.getElementById('meetingModeToggle') && document.getElementById('meetingModeToggle').checked;
 
             // Check native Idle Time
@@ -736,9 +779,7 @@ async function startTracking(options = {}) {
                 const idleSeconds = await window.electronAPI.getIdleTime();
                 if (idleSeconds > IDLE_TIMEOUT_SECONDS && !inMeeting) {
                     console.log(`User idle for ${idleSeconds}s. Stopping tracker automatically.`);
-                    window.electronAPI.setAlwaysOnTop(true);
-                    alert(__('idle_stopped', IDLE_TIMEOUT_MINUTES));
-                    window.electronAPI.setAlwaysOnTop(false);
+                    showToast(__('idle_stopped', IDLE_TIMEOUT_MINUTES), { variant: 'warn' });
                     stopTracking();
                     return; // Exit the loop
                 }
@@ -746,11 +787,9 @@ async function startTracking(options = {}) {
 
             syncTelemetry();
 
-            // Randomly update progress bar to simulate health activity
-            const progress = document.querySelector('.progress');
-            if (progress) {
-                progress.style.width = Math.floor(Math.random() * 30 + 70) + '%';
-            }
+            // (A decorative progress bar used to be driven by Math.random() here,
+            // "to simulate health activity". It signified nothing and is gone;
+            // the real daily progress bar is updated by updateTimerUI().)
         }, 60000);
         // -------------------------
         // LIVE VIDEO STREAMING ENGINE (WebRTC & Command Listener)
@@ -786,7 +825,7 @@ async function startTracking(options = {}) {
         // isTracking is false). Reset fully to the idle state before alerting.
         isTracking = false;
         externalTimeLogId = null; // never leave a mirror marker set on a failed start
-        if (uiInterval) { clearInterval(uiInterval); uiInterval = null; }
+        stopCounterTicking();
         if (trackBtn) {
             trackBtn.classList.remove('active');
             const btnIcon = document.getElementById('btnIcon');
@@ -803,7 +842,7 @@ async function startTracking(options = {}) {
         if (taskTitle && (!taskSelect || taskSelect.value === 'general_work' || taskSelect.value === '')) {
             taskTitle.disabled = false;
         }
-        alert(__('error_starting') + error.message);
+        showToast(__('error_starting') + error.message, { variant: 'error' });
     }
 }
 
@@ -829,7 +868,7 @@ async function stopTracking(options = {}) {
     const trackBtn = document.getElementById('trackBtn');
     if (trackBtn) trackBtn.disabled = true;
 
-    if (uiInterval) clearInterval(uiInterval);
+    stopCounterTicking();
     if (trackingInterval) clearInterval(trackingInterval);
     // NOTE: rulesRefreshInterval and distractionGuardInterval are intentionally
     // NOT cleared here. The guard interval keeps ticking, but enforceDistractionBlock()
@@ -984,9 +1023,129 @@ function updateTimerUI() {
 
 // Separate UI update interval function
 function incrementAndDisplay() {
-    seconds++;
-    currentSessionSeconds++;
+    const now = Date.now();
+
+    if (lastTickMs === null) {
+        // First tick after (re)starting the counter: anchor only, credit nothing.
+        lastTickMs = now;
+        updateTimerUI();
+        return;
+    }
+
+    let deltaMs = now - lastTickMs;
+    lastTickMs = now;
+
+    // A negative delta means the system clock stepped backwards (NTP correction,
+    // manual change, DST on a naive clock). Credit nothing rather than unwinding
+    // the counter.
+    if (deltaMs < 0) deltaMs = 0;
+    if (deltaMs > MAX_TICK_DELTA_MS) deltaMs = 0;
+
+    tickRemainderMs += deltaMs;
+    const wholeSeconds = Math.floor(tickRemainderMs / 1000);
+    if (wholeSeconds > 0) {
+        tickRemainderMs -= wholeSeconds * 1000;
+        seconds += wholeSeconds;
+        currentSessionSeconds += wholeSeconds;
+    }
+
     updateTimerUI();
+}
+
+// Anchor the clock immediately before the interval starts so the first real tick
+// measures from the right instant.
+function startCounterTicking() {
+    if (uiInterval) clearInterval(uiInterval);
+    lastTickMs = Date.now();
+    tickRemainderMs = 0;
+    uiInterval = setInterval(incrementAndDisplay, 1000);
+}
+
+function stopCounterTicking() {
+    if (uiInterval) { clearInterval(uiInterval); uiInterval = null; }
+    lastTickMs = null;
+    tickRemainderMs = 0;
+}
+
+/**
+ * Re-anchor the tick clock without crediting the gap. Called after a suspension
+ * or any other event where wall-clock moved but no work happened.
+ */
+function reanchorCounter() {
+    if (uiInterval) {
+        lastTickMs = Date.now();
+        tickRemainderMs = 0;
+    }
+}
+
+/**
+ * Pull the authoritative daily total from the server and adopt it.
+ * `reason` is for the log only.
+ */
+async function reconcileDailyTotal(reason) {
+    try {
+        const res = await fetchWithAuth(`${API_BASE}/tracking/today-stats`);
+        const data = await res.json();
+
+        if (typeof data.today_total_seconds === 'number') {
+            seconds = data.today_total_seconds;
+            counterDayKey = localDayKey();
+            updateTimerUI();
+            console.log(`Daily total reconciled with the server (${reason}): ${seconds}s`);
+        }
+    } catch (err) {
+        console.warn(`Could not reconcile the daily total (${reason}):`, err);
+    }
+}
+
+/**
+ * Has the calendar day turned since the counter was baselined? If so the daily
+ * figure on screen belongs to yesterday.
+ */
+async function checkDayRollover() {
+    const today = localDayKey();
+    if (counterDayKey === null) { counterDayKey = today; return false; }
+    if (counterDayKey === today) return false;
+
+    console.log(`Day rolled over ${counterDayKey} → ${today}; re-baselining the daily counter.`);
+    counterDayKey = today;
+
+    // Reset immediately so the UI cannot show yesterday's total even for a
+    // moment, then take the server's figure for the new day.
+    // The DAILY figure resets; the running session's own counter does not — the
+    // session did not end at midnight, and the server attributes it to its start
+    // day.
+    seconds = 0;
+    updateTimerUI();
+
+    await reconcileDailyTotal('day rollover');
+    return true;
+}
+
+// OS power lifecycle. Without these the renderer could only infer a suspension
+// from an implausibly large timer delta.
+if (window.electronAPI && window.electronAPI.onPowerSuspend) {
+    window.electronAPI.onPowerSuspend(() => {
+        console.log('System suspending — counter anchor released.');
+        lastTickMs = null;   // the next tick after resume anchors instead of crediting
+        tickRemainderMs = 0;
+    });
+}
+
+if (window.electronAPI && window.electronAPI.onPowerResume) {
+    window.electronAPI.onPowerResume(async (payload) => {
+        const sleptSeconds = payload && payload.sleptMs ? Math.round(payload.sleptMs / 1000) : null;
+        console.log(`System resumed${sleptSeconds === null ? '' : ` after ${sleptSeconds}s`}.`);
+
+        reanchorCounter();
+
+        // A suspension can easily straddle midnight.
+        const rolled = await checkDayRollover();
+        if (!rolled) await reconcileDailyTotal('resume from suspend');
+
+        // Anything the network dropped while the lid was shut.
+        flushOfflineQueue();
+    });
 }
 
 async function syncTelemetry() {
@@ -1072,6 +1231,7 @@ async function uploadScreenshot(base64Image, screenIndex = 0) {
                         window_title: formData.get('window_title'),
                         timestamp: Date.now()
                     });
+                    tx.oncomplete = () => { pruneQueue('offline_screenshots'); };
                 } catch (e) {
                     console.error("Local encryption buffering failed:", e);
                 }
@@ -1082,154 +1242,270 @@ async function uploadScreenshot(base64Image, screenIndex = 0) {
     }
 }
 
+// =========================================================================
+// OFFLINE SYNC ENGINE
+// =========================================================================
+
+// One flush at a time. The screenshot drain sleeps 3s between uploads, so a
+// backlog of twenty takes over a minute — comfortably longer than the 20s
+// interval that schedules it. Without this guard, overlapping runs each read the
+// same queue and upload the same screenshots, which duplicates them server-side
+// and burns the storage quota.
+let isFlushing = false;
+
+// An item rejected by the server (4xx) is bad and will stay bad; give up on it
+// rather than blocking everything queued behind it forever.
+const MAX_SYNC_ATTEMPTS = 5;
+
+// Upper bounds on the offline stores. Screenshots are the expensive one — each
+// row holds an encrypted JPEG — and nothing capped them, so a laptop offline for
+// a week filled the IndexedDB quota until writes began failing silently, taking
+// the activity and session queues down with them. When a store is over its cap
+// the OLDEST rows are dropped: the newest evidence is the most useful, and a
+// screenshot from six days ago is not worth losing today's session over.
+const QUEUE_CAPS = {
+    offline_screenshots: 50,
+    offline_activities: 500,
+};
+
+/**
+ * Trim a store to its cap, oldest-first. Rows are ordered by `timestamp` where
+ * present and by the autoincrement key otherwise, so this works for both.
+ */
+async function pruneQueue(storeName) {
+    const cap = QUEUE_CAPS[storeName];
+    if (!cap || !offlineDb) return 0;
+
+    let rows;
+    try {
+        rows = await readAll(storeName);
+    } catch (err) {
+        console.error(`Could not read ${storeName} to prune it:`, err);
+        return 0;
+    }
+
+    if (!rows || rows.length <= cap) return 0;
+
+    rows.sort((a, b) => (a.timestamp || a.id || 0) - (b.timestamp || b.id || 0));
+    const excess = rows.slice(0, rows.length - cap);
+
+    for (const row of excess) {
+        await removeFrom(storeName, row.id !== undefined ? row.id : row.timestamp).catch(() => {});
+    }
+
+    console.warn(`Pruned ${excess.length} oldest row(s) from ${storeName} (cap ${cap}).`);
+    return excess.length;
+}
+
+// Thrown to abandon the current flush cycle without blaming the item: the
+// server is unreachable or erroring, so every remaining item would fail too and
+// counting those as item failures would quarantine a healthy queue.
+class SyncUnavailableError extends Error {}
+
+function idbRequest(request) {
+    return new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error('IndexedDB request failed'));
+    });
+}
+
+function idbTransaction(tx) {
+    return new Promise((resolve, reject) => {
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error('IndexedDB transaction failed'));
+        tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
+    });
+}
+
+function readAll(storeName) {
+    return idbRequest(offlineDb.transaction(storeName, 'readonly').objectStore(storeName).getAll());
+}
+
+function removeFrom(storeName, key) {
+    const tx = offlineDb.transaction(storeName, 'readwrite');
+    tx.objectStore(storeName).delete(key);
+    return idbTransaction(tx);
+}
+
+function putInto(storeName, value) {
+    const tx = offlineDb.transaction(storeName, 'readwrite');
+    tx.objectStore(storeName).put(value);
+    return idbTransaction(tx);
+}
+
+// Classify a response the way the drain loop needs it: a 4xx is this item's
+// fault, anything else (5xx, timeout, DNS failure) is the transport's.
+function assertItemLevelFailure(response) {
+    if (!response || response.status >= 500) throw new SyncUnavailableError();
+}
+
+async function recordItemFailure(storeName, keyField, item) {
+    const attempts = (item.sync_attempts || 0) + 1;
+
+    if (attempts >= MAX_SYNC_ATTEMPTS) {
+        console.error(`Dropping ${storeName} item ${item[keyField]} after ${attempts} rejected attempts.`);
+        await removeFrom(storeName, item[keyField]).catch(() => {});
+        return;
+    }
+
+    item.sync_attempts = attempts;
+    await putInto(storeName, item).catch(() => {});
+}
+
+// Walks a queue item by item. A rejected item is counted and skipped rather than
+// stopping the drain — one undecryptable screenshot used to block every
+// screenshot queued behind it, permanently.
+async function drainQueue(storeName, keyField, sendItem) {
+    let items;
+    try {
+        items = await readAll(storeName);
+    } catch (err) {
+        console.error(`Could not read ${storeName}:`, err);
+        return;
+    }
+
+    for (const item of items || []) {
+        try {
+            await sendItem(item);
+            await removeFrom(storeName, item[keyField]).catch((e) =>
+                console.error(`Synced ${storeName} item ${item[keyField]} but failed to purge it:`, e));
+        } catch (err) {
+            if (err instanceof SyncUnavailableError) return; // server down — try the whole queue again later
+            await recordItemFailure(storeName, keyField, item);
+        }
+    }
+}
+
 async function flushOfflineQueue() {
-    if(!offlineDb || !navigator.onLine) {
+    if (!offlineDb || !navigator.onLine) {
         updateSyncStatus(navigator.onLine ? 'online' : 'offline');
         return;
     }
-    
+    if (isFlushing) return;
+
+    isFlushing = true;
     updateSyncStatus('syncing');
+
     try {
-        // 1. Flush Master Offline Sessions Engine
-        const sessionTx = offlineDb.transaction('offline_sessions', 'readonly');
-        const sessionReq = sessionTx.objectStore('offline_sessions').getAll();
-        
-        await new Promise((resolve) => {
-            sessionReq.onsuccess = async () => {
-                const sessions = sessionReq.result;
-                if(sessions && sessions.length > 0) {
-                    try {
-                        const syncRes = await fetchWithAuth(`${API_BASE}/tracking/sync-offline-sessions`, {
-                            method: 'POST',
-                            body: JSON.stringify({ sessions: sessions })
-                        });
-                        
-                        if(syncRes.ok) {
-                            const data = await syncRes.json();
-                            const mappedIds = data.mapped_ids; // { "local_xxx": 89 }
-                            
-                            // Delete synced sessions
-                            const remTx = offlineDb.transaction('offline_sessions', 'readwrite');
-                            for(let sid of sessions) { remTx.objectStore('offline_sessions').delete(sid.client_id); }
-                            
-                            remTx.oncomplete = () => console.log('Successfully synced and purged offline sessions.');
-                            remTx.onerror = (e) => console.error('Failed to purge offline sessions:', e);
-                            
-                            // Rewire legacy snapshots payload to Authentic IDs
-                            if(Object.keys(mappedIds).length > 0) {
-                                const shotTx = offlineDb.transaction('offline_screenshots', 'readwrite');
-                                const shotReq = shotTx.objectStore('offline_screenshots').getAll();
-                                shotReq.onsuccess = () => {
-                                    const shots = shotReq.result;
-                                    for(let shot of shots) {
-                                        if(mappedIds[shot.time_log_id]) {
-                                            shot.time_log_id = mappedIds[shot.time_log_id];
-                                            shotTx.objectStore('offline_screenshots').put(shot);
-                                        }
-                                    }
-                                    resolve();
-                                };
-                            } else { resolve(); }
-                        } else { resolve(); }
-                    } catch(e) { resolve(); }
-                } else { resolve(); }
-            };
-        });
-        
-        // 2. Flush Offline Screenshots Block
-        const tx = offlineDb.transaction('offline_screenshots', 'readonly');
-        const req = tx.objectStore('offline_screenshots').getAll();
-        req.onsuccess = async () => {
-            const items = req.result;
-            for (const item of items) {
-                // Ignore artifacts bound to unsynchronized internal offline states to avoid constraint exception loop
-                if(String(item.time_log_id).startsWith('local_')) continue;
-                
-                try {
-                    let imageBlob;
-                    if (item.encrypted_image && item.iv) {
-                        imageBlob = await decryptScreenshot(item.encrypted_image, item.iv, token);
-                    } else {
-                        imageBlob = item.image_blob; // Fallback for legacy unencrypted database entries
+        // 1. Sessions.
+        //
+        // Only CLOSED sessions are eligible. The session that is being tracked
+        // right now is written to this store at start with ended_at: null so a
+        // crash cannot lose it — but uploading it mid-flight and deleting the
+        // local row (as this used to) stranded it: the server kept a 'running'
+        // row with 0 seconds, and stopTracking() then found nothing locally to
+        // attach the real duration to. Every offline session that regained
+        // connectivity before it ended lost its time that way.
+        let sessions = [];
+        try {
+            sessions = (await readAll('offline_sessions')).filter((s) => !!s.ended_at);
+        } catch (err) {
+            console.error('Could not read offline_sessions:', err);
+        }
+
+        if (sessions.length > 0) {
+            try {
+                const syncRes = await fetchWithAuth(`${API_BASE}/tracking/sync-offline-sessions`, {
+                    method: 'POST',
+                    body: JSON.stringify({ sessions }),
+                });
+
+                if (syncRes.ok) {
+                    const data = await syncRes.json();
+                    const mappedIds = data.mapped_ids || {};
+
+                    // Purge only what we actually sent, by key — never the whole store.
+                    for (const sess of sessions) {
+                        await removeFrom('offline_sessions', sess.client_id).catch((e) =>
+                            console.error('Failed to purge synced session', sess.client_id, e));
                     }
 
-                    let formData = new FormData();
-                    formData.append('time_log_id', item.time_log_id);
-                    formData.append('image', imageBlob, `shot_offline_${item.timestamp}.jpg`);
-                    formData.append('activity_percentage', item.activity_percentage);
-                    formData.append('window_title', item.window_title);
-                    
-                    const response = await fetchWithAuth(`${API_BASE}/tracking/screenshot`, {
-                        method: 'POST',
-                        body: formData,
-                        timeoutMs: 60000 // image upload — allow longer than the default
-                    });
-                    
-                    if (response.ok) {
-                        const delTx = offlineDb.transaction('offline_screenshots', 'readwrite');
-                        delTx.objectStore('offline_screenshots').delete(item.id);
-                        delTx.onerror = (e) => console.error('Failed to purge offline screenshot map id:', item.id, e);
-                    } else break; 
-
-                    // Throttling sync: wait 3 seconds to avoid chocking client internet connection
-                    await new Promise(resolve => setTimeout(resolve, 3000));
-                } catch(e) { 
-                    console.error("Failed to decrypt or sync offline screenshot id:", item.id, e);
-                    break; 
+                    // Re-point queued screenshots from the local id to the real one.
+                    if (Object.keys(mappedIds).length > 0) {
+                        try {
+                            const shots = await readAll('offline_screenshots');
+                            for (const shot of shots || []) {
+                                if (mappedIds[shot.time_log_id]) {
+                                    shot.time_log_id = mappedIds[shot.time_log_id];
+                                    await putInto('offline_screenshots', shot).catch(() => {});
+                                }
+                            }
+                        } catch (err) {
+                            console.error('Could not re-point queued screenshots:', err);
+                        }
+                    }
                 }
+            } catch (err) {
+                console.warn('Offline session sync unavailable:', err);
             }
-        };
+        }
 
-        // 3. Flush Offline Activities Block
-        const actTx = offlineDb.transaction('offline_activities', 'readonly');
-        const actReq = actTx.objectStore('offline_activities').getAll();
-        actReq.onsuccess = async () => {
-            const items = actReq.result;
-            for (const item of items) {
-                // Ignore activities bound to unsynchronized internal offline states to avoid constraint exception loop
-                if(String(item.time_log_id).startsWith('local_')) continue;
-                
-                try {
-                    const response = await fetchWithAuth(`${API_BASE}/tracking/activity`, {
-                        method: 'POST',
-                        body: JSON.stringify({
-                            time_log_id: item.time_log_id,
-                            activities: item.activities
-                        })
-                    });
-                    
-                    if (response.ok) {
-                        const delTx = offlineDb.transaction('offline_activities', 'readwrite');
-                        delTx.objectStore('offline_activities').delete(item.id);
-                        delTx.onerror = (e) => console.error('Failed to purge offline activity map id:', item.id, e);
-                    } else break;
-                } catch(e) { break; }
-            }
-        };
+        // 2. Screenshots.
+        await drainQueue('offline_screenshots', 'id', async (item) => {
+            // Still bound to a local session id — that session has not synced
+            // yet, so there is no server-side row to attach this to. Leave it
+            // queued without counting an attempt against it.
+            if (String(item.time_log_id).startsWith('local_')) throw new SyncUnavailableError();
 
-        // 4. Flush Offline Stops Block
-        const stopTx = offlineDb.transaction('offline_stops', 'readonly');
-        const stopReq = stopTx.objectStore('offline_stops').getAll();
-        stopReq.onsuccess = async () => {
-            const items = stopReq.result;
-            for (const item of items) {
-                try {
-                    const response = await fetchWithAuth(`${API_BASE}/tracking/session/${item.time_log_id}/stop`, {
-                        method: 'POST',
-                        body: JSON.stringify({ total_seconds: item.total_seconds, ended_at: item.stopped_at })
-                    });
-                    
-                    if (response.ok) {
-                        const delTx = offlineDb.transaction('offline_stops', 'readwrite');
-                        delTx.objectStore('offline_stops').delete(item.time_log_id);
-                        delTx.oncomplete = () => console.log(`Purged synced offline stop for session ${item.time_log_id}`);
-                    } else break;
-                } catch(e) { break; }
+            let imageBlob;
+            if (item.encrypted_image && item.iv) {
+                imageBlob = await decryptScreenshot(item.encrypted_image, item.iv, token);
+            } else {
+                imageBlob = item.image_blob; // legacy unencrypted entries
             }
-        };
-    } catch(err) {
+
+            const formData = new FormData();
+            formData.append('time_log_id', item.time_log_id);
+            formData.append('image', imageBlob, `shot_offline_${item.timestamp}.jpg`);
+            formData.append('activity_percentage', item.activity_percentage);
+            formData.append('window_title', item.window_title);
+
+            const response = await fetchWithAuth(`${API_BASE}/tracking/screenshot`, {
+                method: 'POST',
+                body: formData,
+                timeoutMs: 60000, // image upload — allow longer than the default
+            });
+
+            if (!response.ok) {
+                assertItemLevelFailure(response);
+                throw new Error(`Screenshot rejected with ${response.status}`);
+            }
+
+            // Throttle so a large backlog does not saturate the connection.
+            await new Promise((resolve) => setTimeout(resolve, 3000));
+        });
+
+        // 3. Activities.
+        await drainQueue('offline_activities', 'id', async (item) => {
+            if (String(item.time_log_id).startsWith('local_')) throw new SyncUnavailableError();
+
+            const response = await fetchWithAuth(`${API_BASE}/tracking/activity`, {
+                method: 'POST',
+                body: JSON.stringify({ time_log_id: item.time_log_id, activities: item.activities }),
+            });
+
+            if (!response.ok) {
+                assertItemLevelFailure(response);
+                throw new Error(`Activity rejected with ${response.status}`);
+            }
+        });
+
+        // 4. Deferred stops.
+        await drainQueue('offline_stops', 'time_log_id', async (item) => {
+            const response = await fetchWithAuth(`${API_BASE}/tracking/session/${item.time_log_id}/stop`, {
+                method: 'POST',
+                body: JSON.stringify({ total_seconds: item.total_seconds, ended_at: item.stopped_at }),
+            });
+
+            if (!response.ok) {
+                assertItemLevelFailure(response);
+                throw new Error(`Stop rejected with ${response.status}`);
+            }
+        });
+    } catch (err) {
         console.warn('Sync flush error', err);
     } finally {
+        isFlushing = false;
         updateSyncStatus(navigator.onLine ? 'online' : 'offline');
     }
 }
@@ -1433,6 +1709,7 @@ async function uploadActivity() {
                 activities: activities,
                 timestamp: Date.now()
             });
+            tx.oncomplete = () => { pruneQueue('offline_activities'); };
         }
         return;
     }
@@ -1464,7 +1741,7 @@ async function uploadActivity() {
                 if (toggle.checked) {
                     toggle.checked = false;
                     console.warn("Meeting mode limit reached for today. Disabling meeting mode.");
-                    alert("Meeting mode limit reached for today! Mode disabled.");
+                    showToast("Meeting mode limit reached for today! Mode disabled.", { variant: 'warn' });
                 }
                 toggle.disabled = true;
             }
@@ -1480,6 +1757,7 @@ async function uploadActivity() {
                 activities: activities,
                 timestamp: Date.now()
             });
+            tx.oncomplete = () => { pruneQueue('offline_activities'); };
         }
     }
 }
@@ -1530,7 +1808,7 @@ function triggerAntiCheat() {
                 })
             }).catch(e => console.warn('Failed to send captcha timeout violation:', e));
 
-            alert(__('captcha_timeout'));
+            showToast(__('captcha_timeout'), { variant: 'warn' });
             stopTracking();
         }
     }, 1000);
@@ -1546,7 +1824,7 @@ document.getElementById('verifyCaptchaBtn').addEventListener('click', () => {
         // Reload engine for next random strike
         startAntiCheat();
     } else {
-        alert(__('captcha_wrong'));
+        showToast(__('captcha_wrong'), { variant: 'warn' });
     }
 });
 
@@ -2023,7 +2301,7 @@ async function loadDistractingApps() {
 
 function startFocusMode() {
     if (!isTracking) {
-        alert(currentLocale === 'ar' ? 'يجب بدء التتبع أولاً لتفعيل جلسة التركيز!' : 'You must start tracking first to activate a focus session!');
+        showToast(currentLocale === 'ar' ? 'يجب بدء التتبع أولاً لتفعيل جلسة التركيز!' : 'You must start tracking first to activate a focus session!', { variant: 'warn' });
         return;
     }
     
@@ -2050,7 +2328,7 @@ function startFocusMode() {
         } else {
             // Focus period completed! Trigger break
             try { playFocusWarningBeep(); } catch (e) { /* audio is best-effort */ }
-            alert(__('focus_break'));
+            showToast(__('focus_break'));
             stopFocusMode();
         }
     }, 1000);

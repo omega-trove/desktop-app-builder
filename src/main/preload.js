@@ -67,7 +67,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
     setAlwaysOnTop: (active) => ipcRenderer.send('set-always-on-top', active),
 
-    logError: (msg) => ipcRenderer.send('log-error', msg)
+    logError: (msg) => ipcRenderer.send('log-error', msg),
+
+    // OS power lifecycle. The renderer re-anchors its clock and reconciles with
+    // the server on resume rather than inferring a suspension from a large
+    // timer delta.
+    onPowerSuspend: (callback) => ipcRenderer.on('power-suspend', (_e, payload) => callback(payload)),
+    onPowerResume: (callback) => ipcRenderer.on('power-resume', (_e, payload) => callback(payload)),
+    onScreenLock: (callback) => ipcRenderer.on('power-lock', (_e, payload) => callback(payload)),
+    onScreenUnlock: (callback) => ipcRenderer.on('power-unlock', (_e, payload) => callback(payload))
 });
 
 console.log('✅ Preload script loaded successfully - ElectronAPI exposed');

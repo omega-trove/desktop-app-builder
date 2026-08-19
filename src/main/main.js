@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, powerMonitor, desktopCapturer, Tray, Menu, dialog, nativeImage, safeStorage, systemPreferences, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, powerMonitor, screen, desktopCapturer, Tray, Menu, dialog, nativeImage, safeStorage, systemPreferences, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { exec: _rawExec } = require('child_process');
@@ -280,11 +280,154 @@ if (process.platform === 'win32') {
     app.disableHardwareAcceleration();
 }
 
+/**
+ * Origins the renderer legitimately talks to, derived from the loaded config so
+ * a self-hosted API_BASE is covered without editing this list.
+ */
+function allowedConnectOrigins() {
+    const origins = new Set([
+        'https://freeipapi.com',   // geo-IP fallbacks used by getNativeLocation
+        'https://ipapi.co',
+        'https://ipwho.is',
+    ]);
+
+    try {
+        if (config && config.API_BASE) {
+            // env.json ships API_BASE without a scheme ("hrm.omegatrack.ai/api").
+            // Both renderers already prepend https:// before using it; the CSP has
+            // to normalise identically or new URL() throws, the origin is dropped
+            // from connect-src, and every API call is blocked by our own policy.
+            const raw = String(config.API_BASE).trim();
+            const absolute = /^https?:\/\//i.test(raw) ? raw : 'https://' + raw;
+            origins.add(new URL(absolute).origin);
+        }
+    } catch (err) {
+        console.warn('⚠️ Could not derive an origin from API_BASE for the CSP:', err.message);
+    }
+
+    return Array.from(origins);
+}
+
+/**
+ * Content-Security-Policy for the renderer.
+ *
+ * There was none at all. The renderer holds the full electronAPI bridge —
+ * screen capture, token access, input simulation — so any script that reached
+ * it would inherit all of that. script-src is 'self' only, which is why the
+ * three inline <script> blocks in the views were extracted into modules first.
+ *
+ * style-src keeps 'unsafe-inline': the views carry inline style attributes
+ * throughout, and removing them is a markup refactor rather than a security fix.
+ * It is a far smaller exposure than inline script and is noted as follow-up.
+ */
+function contentSecurityPolicy() {
+    return [
+        "default-src 'none'",
+        "script-src 'self'",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+        "font-src 'self' https://fonts.gstatic.com data:",
+        "img-src 'self' data: blob:",
+        "media-src 'self' blob:",
+        `connect-src 'self' ${allowedConnectOrigins().join(' ')}`,
+        "frame-src 'none'",
+        "object-src 'none'",
+        "base-uri 'none'",
+        "form-action 'none'",
+    ].join('; ');
+}
+
+/**
+ * Deny-by-default navigation. Without these a renderer that follows a hostile
+ * link replaces the trusted document while keeping the preload bridge, and any
+ * window.open() spawns a full BrowserWindow with the same privileges.
+ */
+function hardenNavigation(contents) {
+    contents.on('will-navigate', (event, url) => {
+        const current = contents.getURL();
+        // Only in-app file:// navigation between the bundled views is allowed.
+        if (url.startsWith('file://') && current.startsWith('file://')) return;
+
+        event.preventDefault();
+        console.warn('⛔ Blocked in-app navigation to', url);
+    });
+
+    contents.setWindowOpenHandler(({ url }) => {
+        // Never open a second privileged window. A genuine external link goes to
+        // the user's browser, where it has no access to this app.
+        if (/^https:\/\//i.test(url)) {
+            shell.openExternal(url).catch((err) => console.warn('Could not open externally:', err));
+        } else {
+            console.warn('⛔ Blocked window.open for', url);
+        }
+        return { action: 'deny' };
+    });
+
+    contents.on('will-attach-webview', (event) => {
+        event.preventDefault();
+        console.warn('⛔ Blocked <webview> attachment');
+    });
+}
+
+/**
+ * OS sleep / wake and screen lock.
+ *
+ * powerMonitor was imported for getSystemIdleTime() and nothing else, so a
+ * suspend was invisible to the app. Chromium freezes timers while the machine is
+ * asleep, then fires the pending one on wake with a delta covering the whole
+ * suspension — which the renderer's clock now discards, but only because it
+ * happens to exceed the sleep threshold. Telling the renderer explicitly is the
+ * difference between a guess and a fact: it re-anchors against wall-clock,
+ * reconciles the daily total with the server, and flushes anything the network
+ * dropped while the lid was shut.
+ */
+function registerPowerLifecycle() {
+    const notifyRenderer = (channel, payload) => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send(channel, payload);
+        }
+    };
+
+    let suspendedAt = null;
+
+    powerMonitor.on('suspend', () => {
+        suspendedAt = Date.now();
+        console.log('💤 System suspending — pausing the counter.');
+        notifyRenderer('power-suspend', { at: suspendedAt });
+    });
+
+    powerMonitor.on('resume', () => {
+        const sleptMs = suspendedAt ? Date.now() - suspendedAt : null;
+        suspendedAt = null;
+        console.log(`☀️ System resumed after ${sleptMs === null ? 'unknown' : Math.round(sleptMs / 1000) + 's'}.`);
+        notifyRenderer('power-resume', { sleptMs });
+    });
+
+    // Locking the screen is not sleeping — the machine keeps running and a
+    // tracked session may legitimately continue — so this is reported for
+    // completeness and left for the renderer's idle rules to act on.
+    powerMonitor.on('lock-screen', () => notifyRenderer('power-lock', {}));
+    powerMonitor.on('unlock-screen', () => notifyRenderer('power-unlock', {}));
+}
+
 app.whenReady().then(() => {
     loadConfig();        // Load API config first
 
     // Auto-approve Geolocation, Media, and Display Capture permissions for the app
     const { session } = require('electron');
+
+    session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+        callback({
+            responseHeaders: {
+                ...details.responseHeaders,
+                'Content-Security-Policy': [contentSecurityPolicy()],
+            },
+        });
+    });
+
+    app.on('web-contents-created', (_event, contents) => hardenNavigation(contents));
+    BrowserWindow.getAllWindows().forEach((win) => hardenNavigation(win.webContents));
+
+    registerPowerLifecycle();
     session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
         if (['geolocation', 'media', 'display-capture'].includes(permission)) {
             return callback(true);
@@ -663,6 +806,10 @@ ipcMain.handle('get-token', () => {
     
     try {
         if (fs.existsSync(secureTokenPath)) {
+            // Tighten permissions left behind by an older build that wrote with
+            // the default mode.
+            try { fs.chmodSync(secureTokenPath, 0o600); } catch (e) { /* best effort */ }
+
             const encryptedBuffer = fs.readFileSync(secureTokenPath);
             if (safeStorage.isEncryptionAvailable()) {
                 authSessionToken = safeStorage.decryptString(encryptedBuffer);
@@ -677,6 +824,10 @@ ipcMain.handle('get-token', () => {
     return null;
 });
 
+// True once we have warned about an unencrypted fallback, so the warning is
+// loud but not repeated on every token write.
+let warnedAboutPlaintextToken = false;
+
 ipcMain.on('set-token', (event, token) => {
     authSessionToken = token;
     try {
@@ -684,15 +835,28 @@ ipcMain.on('set-token', (event, token) => {
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
         }
-        
+
         if (safeStorage.isEncryptionAvailable()) {
-            const encryptedBuffer = safeStorage.encryptString(token);
-            fs.writeFileSync(secureTokenPath, encryptedBuffer);
-        } else {
-            fs.writeFileSync(secureTokenPath, Buffer.from(token, 'utf8'));
+            fs.writeFileSync(secureTokenPath, safeStorage.encryptString(token), { mode: 0o600 });
+            return;
+        }
+
+        // No OS keyring (common on a Linux box without gnome-keyring/kwallet).
+        // The token is a bearer credential for the whole account, and the file
+        // is named .enc, so writing it in the clear without saying so was a
+        // silent downgrade. Restrict it to the owner and say it out loud.
+        fs.writeFileSync(secureTokenPath, Buffer.from(token, 'utf8'), { mode: 0o600 });
+
+        if (!warnedAboutPlaintextToken) {
+            warnedAboutPlaintextToken = true;
+            console.warn(
+                '⚠️  OS encryption (safeStorage) is unavailable on this machine. ' +
+                'The session token is stored UNENCRYPTED at ' + secureTokenPath + ' ' +
+                '(permissions 0600). Install a system keyring to enable encryption at rest.'
+            );
         }
     } catch (err) {
-        console.error('❌ Failed to encrypt and save secure token to disk:', err);
+        console.error('❌ Failed to save session token to disk:', err);
     }
 });
 
@@ -879,7 +1043,41 @@ $hwnd = [Win32Close]::GetForegroundWindow();
 });
 
 // Simulate OS-level Mouse Click at coordinates (Windows & macOS)
-ipcMain.handle('simulate-mouse-click', (event, { x, y }) => {
+/**
+ * Coerce a renderer-supplied coordinate into an integer inside the primary
+ * display, or return null.
+ *
+ * Both platform branches below interpolate these values into a shell script —
+ * PowerShell on Windows, JXA on macOS. Nothing else validated them. The one
+ * caller today happens to sanitise by accident (parseFloat then Math.round of a
+ * screen-relative percentage), and the renderer currently has no XSS sink, so
+ * this was not exploitable — but the sink is exposed to every script in the
+ * renderer through the preload bridge, and "not exploitable yet" is one careless
+ * caller away from arbitrary command execution as the signed-in user. Validate
+ * at the sink, where the guarantee has to hold.
+ */
+function sanitizeClickCoordinate(value, upperBound) {
+    // Deliberately no coercion. Number(null), Number([]) and Number('') are all
+    // 0, so a coercing check would turn a caller bug — or a crafted payload —
+    // into a silent click at the origin. The only caller sends real numbers.
+    if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+
+    const rounded = Math.round(value);
+    if (rounded < 0) return 0;
+    if (rounded > upperBound) return upperBound;
+    return rounded;
+}
+
+ipcMain.handle('simulate-mouse-click', (event, payload) => {
+    const { width, height } = screen.getPrimaryDisplay().size;
+    const x = sanitizeClickCoordinate(payload && payload.x, width);
+    const y = sanitizeClickCoordinate(payload && payload.y, height);
+
+    if (x === null || y === null) {
+        console.warn('⚠️ Rejected simulate-mouse-click with non-numeric coordinates:', payload);
+        return Promise.resolve(false);
+    }
+
     return new Promise((resolve) => {
         if (process.platform === 'win32') {
             const psScript = `

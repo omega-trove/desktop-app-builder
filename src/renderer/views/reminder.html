@@ -208,25 +208,6 @@
         <button class="action-button" id="stopBtn">Stop Reminding</button>
     </div>
 
-    <script>
-        const locale = localStorage.getItem('tracker_locale') || 'ar';
-        if (locale === 'ar') {
-            document.body.dir = 'rtl';
-            document.getElementById('reminderTitle').innerText = 'أنت في استراحة';
-            document.getElementById('reminderSubtitle').innerText = 'يرجى تفعيل مؤقت العمل';
-            document.getElementById('stopBtn').innerText = 'إيقاف التذكير';
-        } else {
-            document.body.dir = 'ltr';
-            document.getElementById('reminderTitle').innerText = 'On a break';
-            document.getElementById('reminderSubtitle').innerText = 'Please start the timer';
-            document.getElementById('stopBtn').innerText = 'Stop Reminding';
-        }
-
-        document.getElementById('stopBtn').addEventListener('click', () => {
-            if (window.electronAPI && window.electronAPI.stopRemindingClicked) {
-                window.electronAPI.stopRemindingClicked();
-            }
-        });
-    </script>
+    <script src="../js/reminder-renderer.js"></script>
 </body>
 </html>

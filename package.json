@@ -9,7 +9,8 @@
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "npm run clean && electron-builder --win",
     "build:mac": "npm run clean && electron-builder --mac",
-    "build:all": "npm run clean && electron-builder --win --mac --linux"
+    "build:all": "npm run clean && electron-builder --win --mac --linux",
+    "test": "node --test test/*.test.js"
   },
   "build": {
     "appId": "com.omegatrack.tracker",
