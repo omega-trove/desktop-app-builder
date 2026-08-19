@@ -12,7 +12,7 @@ function loadDayLogic({ today, statsSeconds = 0, statsFails = false }) {
     const reconcile = slice(src, 'async function reconcileDailyTotal', '\n}');
     const rollover = slice(src, 'async function checkDayRollover', '\n}');
 
-    const state = { seconds: 500, updates: 0, fetches: 0, now: today };
+    const state = { seconds: 500, updates: 0, fetches: 0, caches: 0, now: today };
 
     const factory = new Function('state', `
         let seconds = state.seconds;
@@ -21,6 +21,7 @@ function loadDayLogic({ today, statsSeconds = 0, statsFails = false }) {
         const Date = function () { return new global.Date(state.now); };
         Date.now = () => new global.Date(state.now).getTime();
         const updateTimerUI = () => { state.updates++; };
+        const cacheDailyTotal = () => { state.caches++; };
         const console = { log() {}, warn() {} };
         const fetchWithAuth = async () => {
             state.fetches++;

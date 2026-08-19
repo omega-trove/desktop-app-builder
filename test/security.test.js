@@ -117,3 +117,63 @@ test('the token is written owner-only on both paths', () => {
     assert.strictEqual(modes.length, 2, 'encrypted and fallback writes must both be 0600');
     assert.match(write, /UNENCRYPTED/, 'the downgrade must be stated, not silent');
 });
+
+test('every view carries the policy in the document, not just in a header', () => {
+    // The main-process CSP is delivered via onHeadersReceived, which file://
+    // documents never receive — so for these pages the header was decorative and
+    // the app ran with no policy at all. The meta tag is the enforcing one.
+    const views = path.join(__dirname, '..', 'src', 'renderer', 'views');
+    const files = fs.readdirSync(views).filter((f) => f.endsWith('.html'));
+    assert.ok(files.length >= 3, 'expected the login, tracker and reminder views');
+
+    for (const file of files) {
+        const html = fs.readFileSync(path.join(views, file), 'utf8');
+        const meta = html.match(/<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]+)"/i);
+        assert.ok(meta, `${file} has no document-level CSP`);
+
+        const policy = meta[1];
+        assert.match(policy, /default-src 'none'/, `${file}: must deny by default`);
+        assert.match(policy, /script-src 'self' file:;/, `${file}: script must be local-only`);
+        assert.doesNotMatch(policy, /script-src[^;]*unsafe-inline/, `${file}: inline script must stay banned`);
+        assert.doesNotMatch(policy, /script-src[^;]*unsafe-eval/, `${file}: eval must stay banned`);
+        assert.doesNotMatch(policy, /script-src[^;]*https:/, `${file}: remote script must stay banned`);
+        assert.match(policy, /object-src 'none'/, `${file}: plugins must be blocked`);
+        assert.match(policy, /base-uri 'none'/, `${file}: <base> hijacking must be blocked`);
+        assert.match(policy, /frame-src 'none'/, `${file}: framing must be blocked`);
+    }
+});
+
+test('the screenshot path does not depend on fetching a data: URL', () => {
+    // fetch() of a data: URL is governed by connect-src, so the previous
+    // base64 -> Blob round trip would have been blocked the moment the policy
+    // above started applying.
+    const renderer = fs.readFileSync(
+        path.join(__dirname, '..', 'src', 'renderer', 'js', 'tracker-renderer.js'), 'utf8');
+    const upload = slice(renderer, 'async function uploadScreenshot', '\n}');
+    assert.doesNotMatch(upload, /await fetch\(base64Image\)/, 'decode inline instead of fetching data:');
+    assert.match(upload, /dataUrlToBlob\(base64Image\)/);
+});
+
+test('only the bundled views can be navigated to', () => {
+    const src = source();
+    assert.match(src, /const ALLOWED_VIEWS = new Set\(\['login', 'tracker', 'reminder'\]\)/,
+        'the view list must be a whitelist');
+
+    const handler = slice(src, "ipcMain.on('navigate-to'", '\n});');
+    const guardAt = handler.indexOf('ALLOWED_VIEWS.has(page)');
+    const loadAt = handler.indexOf('loadFile');
+    assert.ok(guardAt !== -1, 'the handler must check the whitelist');
+    assert.ok(guardAt < loadAt, 'and check it before building any path');
+    assert.match(handler, /return;/, 'an unknown view must be refused, not sanitised');
+});
+
+test('every window that gets the preload bridge is sandboxed', () => {
+    const src = source();
+    const preloads = (src.match(/preload: path\.join\(__dirname, 'preload\.js'\)/g) || []).length;
+    const sandboxes = (src.match(/sandbox: true/g) || []).length;
+    assert.ok(preloads > 0, 'expected at least one window with the bridge');
+    assert.strictEqual(sandboxes, preloads,
+        'every window carrying electronAPI must run sandboxed');
+    assert.doesNotMatch(src, /nodeIntegration: true/);
+    assert.doesNotMatch(src, /contextIsolation: false/);
+});

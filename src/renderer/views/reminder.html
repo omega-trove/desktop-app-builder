@@ -2,6 +2,26 @@
 <html>
 <head>
     <meta charset="UTF-8">
+    <!--
+      Content-Security-Policy, delivered in the document.
+
+      The main process sets this policy as a response header
+      (session.webRequest.onHeadersReceived), but these views are loaded with
+      loadFile() over file://, which never receives that header — so the policy
+      did not apply to a single page in the app. The header stays for any
+      http(s) content; this meta tag is what actually protects these documents.
+
+      script-src is the part that matters: the renderer holds the entire
+      electronAPI bridge (screen capture, session token, input simulation), so
+      no inline or remote script may run. 'self' is paired with file: because a
+      file:// document's origin is opaque and 'self' alone does not reliably
+      match its own sibling files.
+
+      connect-src stays broad on purpose: API_BASE is per-deployment config in
+      env.json and a meta policy cannot be templated at runtime, so it is scoped
+      by scheme instead of by host (plus loopback for local development).
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' file:; style-src 'self' file: 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' file: https://fonts.gstatic.com data:; img-src 'self' file: data: blob:; media-src 'self' file: blob:; connect-src https: http://localhost:* http://127.0.0.1:*; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         * {

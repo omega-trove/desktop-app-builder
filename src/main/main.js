@@ -98,7 +98,13 @@ function gracefulQuit() {
 
     if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents) {
         mainWindow.webContents.send('flush-and-quit');
-        setTimeout(cleanupAndQuit, 5000); // safety net, not the primary mechanism
+        // Safety net, not the primary mechanism. It has to outlast the renderer's
+        // shutdown work — closing the session on the server (capped at 8s) and
+        // then flushing the offline queue — or a slow network would get the
+        // renderer killed mid-stop, which is the data loss this whole path exists
+        // to prevent. Anything still unsent by then is already durable in
+        // IndexedDB and goes out on the next launch.
+        setTimeout(cleanupAndQuit, 12000);
     } else {
         cleanupAndQuit();
     }
@@ -147,6 +153,11 @@ function createWindow() {
             nodeIntegration: false,
             contextIsolation: true,
             enableRemoteModule: false,
+            // The renderer holds the whole electronAPI bridge — screen capture,
+            // token access, input simulation — so it runs in the OS sandbox too.
+            // The preload only uses contextBridge/ipcRenderer, both of which are
+            // available to a sandboxed preload; keep it that way.
+            sandbox: true,
             backgroundThrottling: false
         }
     });
@@ -767,9 +778,20 @@ if ($watcher.Position.Location.IsUnknown -eq $false) {
     });
 });
 
+// The only views that exist. `page` arrived from the renderer and went straight
+// into a path join, so any string containing ../ could load an arbitrary local
+// .html file into a window that carries the full preload bridge. Whitelist the
+// three real views rather than trying to sanitise the string.
+const ALLOWED_VIEWS = new Set(['login', 'tracker', 'reminder']);
+
 // Navigation handler
 ipcMain.on('navigate-to', (event, page) => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
+
+    if (!ALLOWED_VIEWS.has(page)) {
+        console.warn('⛔ Blocked navigation to an unknown view:', page);
+        return;
+    }
 
     // Leaving the tracker for the login screen must ALWAYS fully release the
     // distraction lock. Otherwise the always-on-top + blur-refocus focus trap
@@ -1150,6 +1172,7 @@ ipcMain.on('show-reminder-popup', () => {
             nodeIntegration: false,
             contextIsolation: true,
             enableRemoteModule: false,
+            sandbox: true,
             backgroundThrottling: false
         }
     });
@@ -1236,8 +1259,9 @@ ipcMain.on('set-always-on-top', (event, active) => {
 });
 
 ipcMain.on('confirm-close', () => {
-    isQuitting = true;
-    app.exit(0);
+    // Route through the single teardown rather than exiting straight away:
+    // app.exit(0) left the spawned window-tracker.exe orphaned on Windows.
+    cleanupAndQuit();
 });
 
 ipcMain.on('log-error', (event, msg) => {

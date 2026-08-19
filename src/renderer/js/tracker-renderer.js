@@ -36,6 +36,34 @@ function localDayKey(date) {
     const d = date || new Date();
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
+// Last known daily total, kept per calendar day. /tracking/today-stats is the
+// only source of truth, but it is a network call on a cold start: when it is
+// slow, offline or erroring the counter had nothing to fall back on and showed
+// 00:00:00 over a day's recorded work. This is display continuity only — the
+// server value overwrites it the moment it arrives, and a cache from another
+// day is never used.
+const DAILY_TOTAL_CACHE_KEY = 'tracker_daily_total';
+
+function cacheDailyTotal() {
+    try {
+        localStorage.setItem(DAILY_TOTAL_CACHE_KEY, JSON.stringify({ day: localDayKey(), seconds }));
+    } catch (e) {
+        /* storage full or unavailable — the server remains authoritative */
+    }
+}
+
+function readCachedDailyTotal() {
+    try {
+        const raw = localStorage.getItem(DAILY_TOTAL_CACHE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || parsed.day !== localDayKey()) return null; // yesterday's total is not today's
+        return typeof parsed.seconds === 'number' && parsed.seconds >= 0 ? parsed.seconds : null;
+    } catch (e) {
+        return null;
+    }
+}
+
 let dailyTargetHours = 8.0;
 let uiInterval = null;
 let trackingInterval = null;
@@ -88,6 +116,33 @@ let lastKeyboardInputTime = Date.now();
 let lastMouseActivityTime = Date.now();
 let adaptiveAntiCheatInterval = null;
 
+// ── Real activity measurement ───────────────────────────────────────────────
+// activity_percentage was Math.random()*40+60, labelled "Fake 60-100% active",
+// and keystrokes/mouse_clicks were random too. Those numbers land in
+// manager-facing reports and feed the server's automation detector in
+// TrackingController::logActivity. A figure someone is evaluated on cannot be
+// invented.
+//
+// What can be measured honestly, without a native input hook, is OS-wide idle
+// time (powerMonitor.getSystemIdleTime, bridged as getIdleTime). It is sampled
+// on a short interval; a sample counts as ACTIVE when the OS reports the last
+// input as more recent than the sample window. activity_percentage is then the
+// share of active samples over the reporting period — a real observation with a
+// stated meaning.
+//
+// Raw keystroke / mouse-click counts are deliberately NOT sent: the renderer
+// only ever sees input aimed at its own window, so any count it produces is
+// wrong by construction. Reporting them needs a system-wide native hook, which
+// is a privacy and legal decision (cf. the `keystroke_logging` monitoring
+// setting) rather than something to approximate meanwhile. The server treats
+// both fields as optional and stores 0.
+const ACTIVITY_SAMPLE_INTERVAL_MS = 15000;
+let activitySampleCount = 0;
+let activeSampleCount = 0;
+let activitySamplerInterval = null;
+let lastKnownActivityPercentage = null;
+let lastActivityReportAt = null;
+
 // Dynamic Prohibited Apps BlockList
 let blockList = ['netflix', 'facebook', 'youtube', 'مباراة', 'game'];
 
@@ -117,6 +172,16 @@ request.onsuccess = event => {
     offlineDb = event.target.result;
     setInterval(flushOfflineQueue, 20000); // Attempt sync every 20 seconds
 };
+request.onerror = event => {
+    // Previously unhandled, and the failure was completely silent: offlineDb
+    // stayed undefined, the flush interval above was never registered, and the
+    // app ran with no offline buffering whatsoever while still reporting
+    // "Offline (Local mode)" to the user.
+    console.error(
+        '❌ Could not open the offline database — offline buffering is disabled for this session:',
+        event.target.error
+    );
+};
 
 // On a full exit (X → "Exit completely" or tray Exit), main asks us to flush the
 // offline queue first, then we tell it to finish the teardown.
@@ -135,8 +200,20 @@ let token = null;
 
 document.getElementById('userNameLabel').innerText = localStorage.getItem('user_name') || 'Team Member';
 
-document.getElementById('logoutBtn').addEventListener('click', () => {
-    if(isTracking) stopTracking();
+document.getElementById('logoutBtn').addEventListener('click', async (event) => {
+    // stopTracking() has to COMPLETE before we navigate: navigating tears the
+    // renderer down, and an in-flight stop dies with it — losing the session the
+    // same way the quit path used to. Guard the button so an impatient second
+    // click cannot start a second teardown while the first is still running.
+    const logoutBtn = event.currentTarget;
+    if (logoutBtn.dataset.busy === '1') return;
+    logoutBtn.dataset.busy = '1';
+
+    try {
+        if (isTracking) await stopTracking();
+    } catch (e) {
+        console.error('Error stopping tracking during logout:', e);
+    }
     // Release any active distraction lock and stop the guard before leaving the
     // tracker, so the login screen is never left in a locked/always-on-top state.
     try { dismissDistractionWarning(); } catch (e) {}
@@ -209,6 +286,14 @@ async function initDailyTime() {
     let storedTarget = localStorage.getItem('daily_target_hours');
     if(storedTarget) dailyTargetHours = parseFloat(storedTarget);
 
+    // Show today's last known total immediately, before the network is involved.
+    const cachedTotal = readCachedDailyTotal();
+    if (cachedTotal !== null) {
+        seconds = cachedTotal;
+        counterDayKey = localDayKey();
+        updateTimerUI();
+    }
+
     try {
         const res = await fetchWithAuth(`${API_BASE}/tracking/today-stats`);
         const data = await res.json();
@@ -232,6 +317,7 @@ async function initDailyTime() {
         if (typeof data.today_total_seconds === 'number') {
             seconds = data.today_total_seconds;
             counterDayKey = localDayKey();
+            cacheDailyTotal();
         }
         updateTimerUI();
     } catch(e) {
@@ -695,6 +781,7 @@ async function startTracking(options = {}) {
         }
         document.getElementById('statusText').innerText = __('tracking_active');
         startCounterTicking();
+        startActivitySampling();
 
         if (attachTimeLogId !== null) {
             // ATTACH MODE (HRM → Desktop sync): the server already created this
@@ -786,6 +873,7 @@ async function startTracking(options = {}) {
             } catch(e) {}
 
             syncTelemetry();
+            cacheDailyTotal();
 
             // (A decorative progress bar used to be driven by Math.random() here,
             // "to simulate health activity". It signified nothing and is gone;
@@ -826,6 +914,7 @@ async function startTracking(options = {}) {
         isTracking = false;
         externalTimeLogId = null; // never leave a mirror marker set on a failed start
         stopCounterTicking();
+        stopActivitySampling();
         if (trackBtn) {
             trackBtn.classList.remove('active');
             const btnIcon = document.getElementById('btnIcon');
@@ -869,6 +958,7 @@ async function stopTracking(options = {}) {
     if (trackBtn) trackBtn.disabled = true;
 
     stopCounterTicking();
+    stopActivitySampling();
     if (trackingInterval) clearInterval(trackingInterval);
     // NOTE: rulesRefreshInterval and distractionGuardInterval are intentionally
     // NOT cleared here. The guard interval keeps ticking, but enforceDistractionBlock()
@@ -940,58 +1030,78 @@ async function stopTracking(options = {}) {
         return;
     }
 
-    // Inform server about the stop in the background asynchronously
+    // Close the session on the server BEFORE this function resolves.
+    //
+    // This used to be fire-and-forget. /tracking/today-stats sums only sessions
+    // that have an ended_at, so a stop request that never completed erased the
+    // entire session from the daily total. That is exactly what "quit the app,
+    // reopen it, and the timer reads 00:00:00" was: the quit path awaits
+    // stopTracking(), stopTracking() returned with the request still in flight,
+    // and app.exit(0) destroyed the renderer before it landed. The .catch() that
+    // would have queued an offline stop never ran either, so nothing was left
+    // behind to retry — the time was simply gone.
     try {
         if(!String(targetLogId).startsWith('local_')) {
-            fetchWithAuth(`${API_BASE}/tracking/session/${targetLogId}/stop`, {
-                method: 'POST',
-                body: JSON.stringify({ total_seconds: targetSeconds })
-            }).catch(e => {
+            try {
+                const stopRes = await fetchWithAuth(`${API_BASE}/tracking/session/${targetLogId}/stop`, {
+                    method: 'POST',
+                    body: JSON.stringify({ total_seconds: targetSeconds }),
+                    // A stop is a tiny request. Cap it well under the shutdown
+                    // safety net so quitting never waits out the full default.
+                    timeoutMs: 8000
+                });
+                if (!stopRes.ok) throw new Error('Stop rejected with HTTP ' + stopRes.status);
+            } catch (e) {
                 console.warn("Failed to stop online session normally, saving offline stop request", e);
-                saveOfflineStop(targetLogId, targetSeconds);
-            });
-        } else {
-            // It's a localized offline session
-            if(offlineDb && offlineSessionStartTime) {
-                const tx = offlineDb.transaction('offline_sessions', 'readwrite');
-                const store = tx.objectStore('offline_sessions');
-                const sessionReq = store.get(targetLogId);
-                
-                sessionReq.onsuccess = () => {
-                    if(sessionReq.result) {
-                        let sess = sessionReq.result;
-                        sess.ended_at = new Date().toISOString();
-                        // Record the ACTUAL accumulated active seconds (currentSessionSeconds,
-                        // captured above as targetSeconds) rather than the raw wall-clock span
-                        // (now - started_at). The tick counter only advances while tracking is
-                        // live, so pauses/idle are already excluded. Using wall-clock here was
-                        // the cause of an offline session that was paused (e.g. 2h of work over
-                        // a 5h span) syncing back as the full 5h once the server returned.
-                        sess.total_seconds = targetSeconds;
-                        store.put(sess);
-                    }
-                };
+                await saveOfflineStop(targetLogId, targetSeconds);
             }
+        } else {
+            // It's a localized offline session. Read and write in separate
+            // transactions so the record is durable before we return — the old
+            // callback form could still be pending when the process exited.
+            if(offlineDb && offlineSessionStartTime) {
+                const sess = await idbRequest(
+                    offlineDb.transaction('offline_sessions', 'readonly')
+                        .objectStore('offline_sessions')
+                        .get(targetLogId)
+                );
+                if (sess) {
+                    sess.ended_at = new Date().toISOString();
+                    // Record the ACTUAL accumulated active seconds (currentSessionSeconds,
+                    // captured above as targetSeconds) rather than the raw wall-clock span
+                    // (now - started_at). The tick counter only advances while tracking is
+                    // live, so pauses/idle are already excluded. Using wall-clock here was
+                    // the cause of an offline session that was paused (e.g. 2h of work over
+                    // a 5h span) syncing back as the full 5h once the server returned.
+                    sess.total_seconds = targetSeconds;
+                    await putInto('offline_sessions', sess);
+                }
+            }
+            offlineSessionStartTime = null;
         }
     } catch (error) {
         console.error('Error during stop tracking storage/sync:', error);
     }
+
+    // The counter on screen is now settled for this session; remember it so a
+    // relaunch has something truthful to show before the server answers.
+    cacheDailyTotal();
     startTrackerReminder();
 }
 
-function saveOfflineStop(timeLogId, totalSeconds) {
-    if (offlineDb) {
-        try {
-            const tx = offlineDb.transaction('offline_stops', 'readwrite');
-            tx.objectStore('offline_stops').put({
-                time_log_id: timeLogId,
-                total_seconds: totalSeconds,
-                stopped_at: new Date().toISOString()
-            });
-            console.log(`Saved offline stop request for session ${timeLogId}`);
-        } catch (e) {
-            console.error("Failed to save offline stop request:", e);
-        }
+// Awaited by stopTracking: on the quit path the process exits immediately
+// afterwards, so this has to be committed rather than merely started.
+async function saveOfflineStop(timeLogId, totalSeconds) {
+    if (!offlineDb) return;
+    try {
+        await putInto('offline_stops', {
+            time_log_id: timeLogId,
+            total_seconds: totalSeconds,
+            stopped_at: new Date().toISOString()
+        });
+        console.log(`Saved offline stop request for session ${timeLogId}`);
+    } catch (e) {
+        console.error("Failed to save offline stop request:", e);
     }
 }
 
@@ -1090,6 +1200,7 @@ async function reconcileDailyTotal(reason) {
         if (typeof data.today_total_seconds === 'number') {
             seconds = data.today_total_seconds;
             counterDayKey = localDayKey();
+            cacheDailyTotal();
             updateTimerUI();
             console.log(`Daily total reconciled with the server (${reason}): ${seconds}s`);
         }
@@ -1116,6 +1227,7 @@ async function checkDayRollover() {
     // session did not end at midnight, and the server attributes it to its start
     // day.
     seconds = 0;
+    cacheDailyTotal();
     updateTimerUI();
 
     await reconcileDailyTotal('day rollover');
@@ -1148,18 +1260,90 @@ if (window.electronAPI && window.electronAPI.onPowerResume) {
     });
 }
 
+/**
+ * One idle-time sample. A sample the OS refuses to answer is discarded rather
+ * than counted as idle — an unreadable sample is not evidence that nobody was
+ * working.
+ */
+async function sampleActivity() {
+    if (!window.electronAPI || !window.electronAPI.getIdleTime) return;
+    try {
+        const idleSeconds = await window.electronAPI.getIdleTime();
+        if (typeof idleSeconds !== 'number' || !Number.isFinite(idleSeconds)) return;
+        activitySampleCount++;
+        if (idleSeconds * 1000 < ACTIVITY_SAMPLE_INTERVAL_MS) activeSampleCount++;
+    } catch (e) {
+        /* a failed sample is not an idle sample */
+    }
+}
+
+function startActivitySampling() {
+    stopActivitySampling();
+    activitySampleCount = 0;
+    activeSampleCount = 0;
+    lastActivityReportAt = Date.now();
+    sampleActivity(); // seed immediately so the first upload has an observation
+    activitySamplerInterval = setInterval(sampleActivity, ACTIVITY_SAMPLE_INTERVAL_MS);
+}
+
+function stopActivitySampling() {
+    if (activitySamplerInterval) {
+        clearInterval(activitySamplerInterval);
+        activitySamplerInterval = null;
+    }
+}
+
+/**
+ * Activity share for the period just ended, then start a fresh window. Called
+ * once per telemetry cycle so every screen captured in that cycle reports the
+ * same measured value instead of re-rolling one each.
+ */
+async function consumeActivityPercentage() {
+    if (activitySampleCount === 0) await sampleActivity();
+
+    if (activitySampleCount === 0) {
+        // Idle time is unreadable on this machine. Carry the last real reading
+        // forward rather than invent one; 0 stands only if there has never been
+        // a reading at all.
+        console.warn('Activity sampling unavailable — reporting the last measured value.');
+        return lastKnownActivityPercentage === null ? 0 : lastKnownActivityPercentage;
+    }
+
+    const pct = Math.round((activeSampleCount / activitySampleCount) * 100);
+    activitySampleCount = 0;
+    activeSampleCount = 0;
+    lastKnownActivityPercentage = pct;
+    return pct;
+}
+
+/**
+ * Seconds actually covered by the activity report being sent now. This was
+ * hardcoded to 30 while the reporting interval is 60, so every duration the
+ * server stored was half the truth — and the server gates its automation
+ * detector on this exact value.
+ */
+function consumeActivityDuration() {
+    const now = Date.now();
+    const elapsedMs = lastActivityReportAt === null ? 0 : now - lastActivityReportAt;
+    lastActivityReportAt = now;
+    return Math.max(1, Math.round(elapsedMs / 1000));
+}
+
 async function syncTelemetry() {
     if (!isTracking || !timeLogId) return;
+
+    // Measured once per cycle and shared by every screen in it.
+    const activityPercentage = await consumeActivityPercentage();
 
     // 1. Capture Screens via Electron native desktopCapturer (isolated try-catch)
     try {
         const base64Images = await window.electronAPI.captureScreen();
         if (Array.isArray(base64Images)) {
             for (let i = 0; i < base64Images.length; i++) {
-                await uploadScreenshot(base64Images[i], i);
+                await uploadScreenshot(base64Images[i], i, activityPercentage);
             }
         } else if (base64Images) {
-            await uploadScreenshot(base64Images, 0);
+            await uploadScreenshot(base64Images, 0, activityPercentage);
         }
     } catch (e) {
         console.error("Screenshot capture/sync error:", e);
@@ -1180,16 +1364,36 @@ async function syncTelemetry() {
     }
 }
 
-async function uploadScreenshot(base64Image, screenIndex = 0) {
+/**
+ * Decode a base64 `data:` URL into a Blob without going through fetch().
+ *
+ * fetch() of a data: URL is governed by connect-src, which the renderer's CSP
+ * does not open up (and should not). Decoding inline keeps screenshot upload
+ * working under a strict policy instead of failing the moment one is enforced.
+ */
+function dataUrlToBlob(dataUrl) {
+    const raw = String(dataUrl);
+    const comma = raw.indexOf(',');
+    if (comma === -1) throw new Error('Malformed data URL for screenshot');
+
+    const header = raw.slice(0, comma);
+    if (!/;base64/i.test(header)) throw new Error('Screenshot data URL is not base64-encoded');
+
+    const mime = (header.match(/^data:([^;,]+)/) || [, 'image/jpeg'])[1];
+    const binary = atob(raw.slice(comma + 1));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+}
+
+async function uploadScreenshot(base64Image, screenIndex = 0, activityPercentage = 0) {
     try {
-        // Convert base64 to Blob
-        const response = await fetch(base64Image);
-        const blob = await response.blob();
-        
+        const blob = dataUrlToBlob(base64Image);
+
         let formData = new FormData();
         formData.append('time_log_id', timeLogId);
         formData.append('image', blob, `shot_${Date.now()}_${screenIndex}.jpg`);
-        formData.append('activity_percentage', Math.floor(Math.random() * 40) + 60); // Fake 60-100% active
+        formData.append('activity_percentage', activityPercentage);
         
         // Dynamically retrieve active window for the screenshot metadata
         let activeWin = 'Unknown Window';
@@ -1691,12 +1895,15 @@ async function uploadActivity() {
     else if (activeWindowTitle.includes('Edge')) appName = 'Edge';
     else appName = activeWindowTitle.split(' ')[0] || 'App';
 
+    // keystrokes / mouse_clicks are omitted rather than invented — see the
+    // activity-measurement note at the top of this file. Both are optional
+    // server-side and default to 0, and the server's automation detector reads
+    // them, so sending random values there was actively dangerous once
+    // duration_seconds became long enough for that detector to run.
     const activities = [{
         app_name: appName,
         window_title: activeWindowTitle,
-        duration_seconds: 30,
-        keystrokes: Math.floor(Math.random() * 150),
-        mouse_clicks: Math.floor(Math.random() * 50)
+        duration_seconds: consumeActivityDuration()
     }];
 
     // If tracking is offline / local, buffer to IndexedDB immediately without fetching
