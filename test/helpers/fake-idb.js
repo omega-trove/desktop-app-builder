@@ -3,6 +3,8 @@
    wrappers under test are exercised exactly as written. */
 const KEY_FIELDS = {
     offline_screenshots: 'id',
+    offline_locations: 'id',
+    active_session: 'id',
     offline_activities: 'id',
     offline_stops: 'time_log_id',
     offline_sessions: 'client_id',
@@ -23,6 +25,20 @@ function createFakeDb(initial = {}) {
             const tx = {
                 objectStore() {
                     return {
+                        get(key) {
+                            const req = {};
+                            queueMicrotask(() => {
+                                if (failures.read.has(name)) {
+                                    req.error = new Error('read failed');
+                                    if (req.onerror) req.onerror();
+                                    return;
+                                }
+                                const row = (stores[name] || []).find((r) => r[keyField(name)] === key);
+                                req.result = row ? { ...row } : undefined;
+                                if (req.onsuccess) req.onsuccess();
+                            });
+                            return req;
+                        },
                         getAll() {
                             const req = {};
                             queueMicrotask(() => {

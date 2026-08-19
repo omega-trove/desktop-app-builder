@@ -152,7 +152,14 @@ let IDLE_TIMEOUT_MINUTES = Math.ceil(IDLE_TIMEOUT_SECONDS / 60);
 
 // Initialize Offline Sync Database
 let offlineDb;
-const request = indexedDB.open("OmegaTrackerDB", 4);
+
+// boot() has to know whether the database is usable before it can recover an
+// interrupted session; previously anything running at start-up simply raced the
+// open request and silently saw `offlineDb` as undefined.
+let markOfflineDbReady;
+const offlineDbReady = new Promise((resolve) => { markOfflineDbReady = resolve; });
+
+const request = indexedDB.open("OmegaTrackerDB", 5);
 request.onupgradeneeded = event => {
     offlineDb = event.target.result;
     if (!offlineDb.objectStoreNames.contains('offline_screenshots')) {
@@ -167,9 +174,20 @@ request.onupgradeneeded = event => {
     if (!offlineDb.objectStoreNames.contains('offline_stops')) {
         offlineDb.createObjectStore('offline_stops', { keyPath: 'time_log_id' });
     }
+    if (!offlineDb.objectStoreNames.contains('offline_locations')) {
+        offlineDb.createObjectStore('offline_locations', { keyPath: 'id', autoIncrement: true });
+    }
+    // A single row describing the session that is running right now, refreshed
+    // on a heartbeat. If it is still there at the next launch, the previous run
+    // never got to stop cleanly — an installer replacing the app, a power cut, a
+    // kill from Task Manager — and recoverInterruptedSession() closes it out.
+    if (!offlineDb.objectStoreNames.contains('active_session')) {
+        offlineDb.createObjectStore('active_session', { keyPath: 'id' });
+    }
 };
 request.onsuccess = event => {
     offlineDb = event.target.result;
+    markOfflineDbReady(true);
     setInterval(flushOfflineQueue, 20000); // Attempt sync every 20 seconds
 };
 request.onerror = event => {
@@ -181,6 +199,11 @@ request.onerror = event => {
         '❌ Could not open the offline database — offline buffering is disabled for this session:',
         event.target.error
     );
+    markOfflineDbReady(false);
+};
+request.onblocked = () => {
+    // Another window still holds an older version of the database open.
+    console.warn('⚠️ Offline database upgrade is blocked by another open window.');
 };
 
 // On a full exit (X → "Exit completely" or tray Exit), main asks us to flush the
@@ -611,25 +634,29 @@ async function boot() {
         return;
     }
 
+    // Only the API base needs its own guard: if it cannot be read we fall back
+    // to the compiled-in default and everything below still runs. This used to
+    // wrap the whole boot sequence, with all five calls duplicated in the catch.
     try {
         const base = await window.electronAPI.getApiBase();
         if (base) {
             API_BASE = base.startsWith('http') ? base.replace(/\/$/, '') : 'https://' + base.replace(/\/$/, '');
             console.log('✅ API_BASE loaded:', API_BASE);
         }
-        await initDailyTime();
-        await loadTasks();
-        await loadDistractingApps();
-        initFocusMode();
-        startTrackerReminder();
     } catch (e) {
         console.error('❌ Failed to load API_BASE config:', e);
-        await initDailyTime();
-        await loadTasks();
-        await loadDistractingApps();
-        initFocusMode();
-        startTrackerReminder();
     }
+
+    // Close out a session the previous run was killed in the middle of, BEFORE
+    // asking for today's total — so the recovered time is already part of the
+    // number the user sees rather than appearing a minute later.
+    await recoverInterruptedSession();
+
+    await initDailyTime();
+    await loadTasks();
+    await loadDistractingApps();
+    initFocusMode();
+    startTrackerReminder();
 
     // Keep the rule set fresh and the distraction guard interval armed. The guard
     // only enforces while a tracking session is live (see enforceDistractionBlock),
@@ -838,22 +865,29 @@ async function startTracking(options = {}) {
                 offlineSessionStartTime = new Date().toISOString();
                 document.getElementById('statusText').innerText = __('offline_tracking_active');
 
-                // Insert unclosed session record locally
+                // Insert unclosed session record locally. Awaited: the session
+                // mirror armed just below points at this row, and a kill in the
+                // gap would leave a marker referring to a session that was never
+                // written.
                 if(offlineDb) {
-                    const tx = offlineDb.transaction('offline_sessions', 'readwrite');
-                    tx.objectStore('offline_sessions').put({
+                    await putInto('offline_sessions', {
                         client_id: timeLogId,
                         task_id: taskId,
                         task_title: taskTitle,
                         started_at: offlineSessionStartTime,
                         ended_at: null,
                         total_seconds: 0
-                    });
+                    }).catch((e) => console.error('Could not record the offline session locally:', e));
                 }
             }
         }
 
         
+        // The session now has an id (server, attached or local). Mirror it so an
+        // interrupted run — installer, power cut, Task Manager — can be closed
+        // out at the next launch instead of vanishing from the daily total.
+        startSessionHeartbeat();
+
         // Background interval (Runs every 1 minute)
         trackingInterval = setInterval(async () => {
             // Midnight may have passed since the last tick.
@@ -915,6 +949,7 @@ async function startTracking(options = {}) {
         externalTimeLogId = null; // never leave a mirror marker set on a failed start
         stopCounterTicking();
         stopActivitySampling();
+        stopSessionHeartbeat();
         if (trackBtn) {
             trackBtn.classList.remove('active');
             const btnIcon = document.getElementById('btnIcon');
@@ -959,6 +994,7 @@ async function stopTracking(options = {}) {
 
     stopCounterTicking();
     stopActivitySampling();
+    stopSessionHeartbeat();
     if (trackingInterval) clearInterval(trackingInterval);
     // NOTE: rulesRefreshInterval and distractionGuardInterval are intentionally
     // NOT cleared here. The guard interval keeps ticking, but enforceDistractionBlock()
@@ -1022,6 +1058,10 @@ async function stopTracking(options = {}) {
     const targetSeconds = currentSessionSeconds;
 
     timeLogId = null;
+
+    // We are closing this session deliberately, so the recovery marker must go:
+    // whatever happens below is either delivered or queued with bounded retries.
+    await clearActiveSession();
 
     // HRM-commanded stop: the server already closed this session. Calling the stop
     // endpoint again would be redundant/erroneous, so just drop the local session.
@@ -1089,15 +1129,143 @@ async function stopTracking(options = {}) {
     startTrackerReminder();
 }
 
+// =========================================================================
+// RUNNING-SESSION MIRROR (crash / installer / power-loss recovery)
+// =========================================================================
+// stopTracking() closes the session properly on every path the app controls.
+// It does not control being killed: an NSIS upgrade terminates the running app,
+// and so do power cuts and Task Manager. Because /tracking/today-stats counts
+// only sessions that carry an ended_at, an interrupted session vanished from
+// the daily total entirely — which is why installing a new version showed
+// 00:00:00 afterwards.
+//
+// So the running session is mirrored to IndexedDB and refreshed on a heartbeat.
+// Whatever is still there at the next launch is closed out at the last
+// heartbeat's time, and the server clamps it to the wall-clock window anyway,
+// so the worst case is losing the final heartbeat interval rather than the
+// whole session.
+const ACTIVE_SESSION_KEY = 'current';
+const SESSION_HEARTBEAT_MS = 30000;
+let sessionHeartbeatInterval = null;
+
+async function writeActiveSession() {
+    if (!offlineDb || !timeLogId) return;
+    try {
+        await putInto('active_session', {
+            id: ACTIVE_SESSION_KEY,
+            time_log_id: timeLogId,
+            total_seconds: currentSessionSeconds,
+            updated_at: new Date().toISOString()
+        });
+    } catch (e) {
+        console.warn('Could not mirror the running session:', e);
+    }
+}
+
+async function clearActiveSession() {
+    if (!offlineDb) return;
+    await removeFrom('active_session', ACTIVE_SESSION_KEY).catch(() => {});
+}
+
+function startSessionHeartbeat() {
+    stopSessionHeartbeat();
+    writeActiveSession();
+    sessionHeartbeatInterval = setInterval(writeActiveSession, SESSION_HEARTBEAT_MS);
+}
+
+function stopSessionHeartbeat() {
+    if (sessionHeartbeatInterval) {
+        clearInterval(sessionHeartbeatInterval);
+        sessionHeartbeatInterval = null;
+    }
+}
+
+/**
+ * Close out a session the previous run never got to end. Runs once at boot,
+ * before the daily total is fetched, so the recovered time is already included
+ * in the figure the user sees.
+ */
+async function recoverInterruptedSession() {
+    // boot() awaits this, so it must always settle. A version upgrade blocked by
+    // another window holding the old database would otherwise leave the open
+    // request pending and stall start-up behind it.
+    let readyTimer;
+    const dbUsable = await Promise.race([
+        offlineDbReady,
+        new Promise((resolve) => { readyTimer = setTimeout(() => resolve(false), 5000); })
+    ]);
+    clearTimeout(readyTimer); // the loser of the race must not stay pending
+    if (!dbUsable || !offlineDb) return;
+
+    let record;
+    try {
+        record = await idbRequest(
+            offlineDb.transaction('active_session', 'readonly')
+                .objectStore('active_session')
+                .get(ACTIVE_SESSION_KEY)
+        );
+    } catch (e) {
+        return;
+    }
+    if (!record || !record.time_log_id) return;
+
+    // Drop the marker first: if closing it out fails, the retry lives in the
+    // offline queue, which already has bounded attempts. Replaying the recovery
+    // itself on every launch forever would not.
+    await clearActiveSession();
+
+    const seconds = Math.max(0, parseInt(record.total_seconds, 10) || 0);
+    const endedAt = record.updated_at || new Date().toISOString();
+    console.warn(`Recovering a session the previous run left open: ${record.time_log_id} (${seconds}s).`);
+
+    if (String(record.time_log_id).startsWith('local_')) {
+        // An offline session. Its row is already in offline_sessions with
+        // ended_at null, which the flush deliberately skips — closing it here is
+        // what makes it eligible to upload.
+        try {
+            const sess = await idbRequest(
+                offlineDb.transaction('offline_sessions', 'readonly')
+                    .objectStore('offline_sessions')
+                    .get(record.time_log_id)
+            );
+            if (sess && !sess.ended_at) {
+                sess.ended_at = endedAt;
+                sess.total_seconds = seconds;
+                await putInto('offline_sessions', sess);
+            }
+        } catch (e) {
+            console.error('Could not close the interrupted offline session:', e);
+        }
+        return;
+    }
+
+    // A server-side session. Stop it directly rather than queueing, so the
+    // daily total fetched moments later already includes it; fall back to the
+    // queue only if that fails.
+    try {
+        const res = await fetchWithAuth(`${API_BASE}/tracking/session/${record.time_log_id}/stop`, {
+            method: 'POST',
+            body: JSON.stringify({ total_seconds: seconds, ended_at: endedAt }),
+            timeoutMs: 8000
+        });
+        if (!res.ok) throw new Error('Stop rejected with HTTP ' + res.status);
+    } catch (e) {
+        console.warn('Could not close the interrupted session now — queued for retry:', e);
+        await saveOfflineStop(record.time_log_id, seconds, endedAt);
+    }
+}
+
 // Awaited by stopTracking: on the quit path the process exits immediately
 // afterwards, so this has to be committed rather than merely started.
-async function saveOfflineStop(timeLogId, totalSeconds) {
+async function saveOfflineStop(timeLogId, totalSeconds, stoppedAt) {
     if (!offlineDb) return;
     try {
         await putInto('offline_stops', {
             time_log_id: timeLogId,
             total_seconds: totalSeconds,
-            stopped_at: new Date().toISOString()
+            // A recovered session ended when its last heartbeat was written, not
+            // when we noticed. The server clamps the duration to this window.
+            stopped_at: stoppedAt || new Date().toISOString()
         });
         console.log(`Saved offline stop request for session ${timeLogId}`);
     } catch (e) {
@@ -1241,6 +1409,9 @@ if (window.electronAPI && window.electronAPI.onPowerSuspend) {
         console.log('System suspending — counter anchor released.');
         lastTickMs = null;   // the next tick after resume anchors instead of crediting
         tickRemainderMs = 0;
+        // Checkpoint before the machine goes down: a suspend is frequently the
+        // last thing that happens before a battery dies or an update reboots.
+        if (isTracking) writeActiveSession();
     });
 }
 
@@ -1470,6 +1641,7 @@ const MAX_SYNC_ATTEMPTS = 5;
 const QUEUE_CAPS = {
     offline_screenshots: 50,
     offline_activities: 500,
+    offline_locations: 500,
 };
 
 /**
@@ -1624,18 +1796,20 @@ async function flushOfflineQueue() {
                             console.error('Failed to purge synced session', sess.client_id, e));
                     }
 
-                    // Re-point queued screenshots from the local id to the real one.
+                    // Re-point everything still addressed by a local session id.
                     if (Object.keys(mappedIds).length > 0) {
-                        try {
-                            const shots = await readAll('offline_screenshots');
-                            for (const shot of shots || []) {
-                                if (mappedIds[shot.time_log_id]) {
-                                    shot.time_log_id = mappedIds[shot.time_log_id];
-                                    await putInto('offline_screenshots', shot).catch(() => {});
+                        for (const storeName of ['offline_screenshots', 'offline_locations']) {
+                            try {
+                                const rows = await readAll(storeName);
+                                for (const row of rows || []) {
+                                    if (mappedIds[row.time_log_id]) {
+                                        row.time_log_id = mappedIds[row.time_log_id];
+                                        await putInto(storeName, row).catch(() => {});
+                                    }
                                 }
+                            } catch (err) {
+                                console.error(`Could not re-point queued ${storeName}:`, err);
                             }
-                        } catch (err) {
-                            console.error('Could not re-point queued screenshots:', err);
                         }
                     }
                 }
@@ -1694,7 +1868,29 @@ async function flushOfflineQueue() {
             }
         });
 
-        // 4. Deferred stops.
+        // 4. Locations.
+        await drainQueue('offline_locations', 'id', async (item) => {
+            if (String(item.time_log_id).startsWith('local_')) throw new SyncUnavailableError();
+
+            const response = await fetchWithAuth(`${API_BASE}/tracking/location`, {
+                method: 'POST',
+                body: JSON.stringify({
+                    time_log_id: item.time_log_id,
+                    locations: [{
+                        latitude: item.latitude,
+                        longitude: item.longitude,
+                        captured_at: item.captured_at
+                    }]
+                }),
+            });
+
+            if (!response.ok) {
+                assertItemLevelFailure(response);
+                throw new Error(`Location rejected with ${response.status}`);
+            }
+        });
+
+        // 5. Deferred stops.
         await drainQueue('offline_stops', 'time_log_id', async (item) => {
             const response = await fetchWithAuth(`${API_BASE}/tracking/session/${item.time_log_id}/stop`, {
                 method: 'POST',
@@ -2149,7 +2345,10 @@ function checkJigglerPattern() {
 // -------------------------
 
 async function trackLocation() {
-    if (!isTracking || !timeLogId || String(timeLogId).startsWith('local_')) return;
+    // An offline session used to bail out here, so a whole offline stretch had
+    // no location trail at all — and an online point whose upload failed was
+    // simply lost. Both are buffered now (see sendLocationToServer).
+    if (!isTracking || !timeLogId) return;
     
     const now = Date.now();
     // Only upload location once every 5 minutes (300000 ms)
@@ -2267,14 +2466,43 @@ async function trackLocationViaIp() {
     console.error("All Geo-IP location services failed.");
 }
 
+/**
+ * Queue a point for later. The server accepts captured_at on backfill, so a
+ * late-synced backlog keeps its real timing instead of masquerading as live.
+ */
+async function bufferLocation(latitude, longitude, capturedAt) {
+    if (!offlineDb) return;
+    try {
+        await putInto('offline_locations', {
+            time_log_id: timeLogId,
+            latitude,
+            longitude,
+            captured_at: capturedAt,
+            timestamp: Date.now()
+        });
+        await pruneQueue('offline_locations');
+    } catch (e) {
+        console.error("Could not buffer the location point:", e);
+    }
+}
+
 async function sendLocationToServer(lat, lng) {
+    const capturedAt = new Date().toISOString();
+
+    // An offline session has no server-side row to attach to yet; the flush
+    // re-points these once the session itself syncs.
+    if (String(timeLogId).startsWith('local_')) {
+        await bufferLocation(lat, lng, capturedAt);
+        return;
+    }
+
     try {
         const response = await fetchWithAuth(`${API_BASE}/tracking/location`, {
             method: 'POST',
             body: JSON.stringify({
                 time_log_id: timeLogId,
                 locations: [
-                    { latitude: lat, longitude: lng }
+                    { latitude: lat, longitude: lng, captured_at: capturedAt }
                 ]
             })
         });
@@ -2282,9 +2510,11 @@ async function sendLocationToServer(lat, lng) {
             console.log("Location successfully uploaded to server.");
         } else {
             console.warn("Server rejected location upload:", response.status);
+            await bufferLocation(lat, lng, capturedAt);
         }
     } catch (e) {
         console.error("Network error uploading location:", e);
+        await bufferLocation(lat, lng, capturedAt);
     }
 }
 
